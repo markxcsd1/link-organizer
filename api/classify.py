@@ -4,7 +4,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
+GEMINI_KEY = os.environ["GEMINI_API_KEY"]
 NOTION_KEY    = os.environ["NOTION_API_KEY"]
 SECRET_KEY    = os.environ["SECRET_KEY"]
 
@@ -50,20 +50,15 @@ async def classify(url: str, note: str) -> dict:
 
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_KEY}",
+            headers={"Content-Type": "application/json"},
             json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 256,
-                "messages": [{"role": "user", "content": prompt}],
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": 256},
             },
         )
     r.raise_for_status()
-    text = r.json()["content"][0]["text"].strip()
+    text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
     return json.loads(text)
 
 
@@ -99,7 +94,7 @@ async def classify_link(req: LinkRequest, authorization: str = Header(...)):
     try:
         result = await classify(req.url, req.note)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Claude error: {e}")
+        raise HTTPException(status_code=502, detail=f"Gemini error: {e}")
 
     category = result.get("category", "other").lower()
     if category not in NOTION_DB:

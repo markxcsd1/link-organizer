@@ -23,7 +23,7 @@ An AI-powered agent that automatically classifies any shared link and saves it t
 ## Stack
 
 - **Python** + **FastAPI** — API backend
-- **Claude Haiku** (Anthropic) — link classification
+- **Gemini 1.5 Flash** (Google, free tier) — link classification
 - **Notion API** — storage
 - **Vercel** — deployment
 - **iOS Shortcuts** — mobile trigger
