@@ -1,11 +1,12 @@
-import os, json, httpx
-from fastapi import FastAPI, HTTPException
+import os, json, secrets, httpx
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel
 
 app = FastAPI()
 
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
 NOTION_KEY    = os.environ["NOTION_API_KEY"]
+SECRET_KEY    = os.environ["SECRET_KEY"]
 
 NOTION_DB = {
     "location": os.environ["NOTION_DB_LOCATION"],
@@ -91,7 +92,10 @@ async def save_to_notion(url: str, category: str, name: str, notes: str) -> str:
 
 
 @app.post("/api/classify")
-async def classify_link(req: LinkRequest):
+async def classify_link(req: LinkRequest, authorization: str = Header(...)):
+    if not secrets.compare_digest(authorization, f"Bearer {SECRET_KEY}"):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     try:
         result = await classify(req.url, req.note)
     except Exception as e:
