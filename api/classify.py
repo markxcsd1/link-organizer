@@ -5,15 +5,15 @@ from pydantic import BaseModel
 app = FastAPI()
 
 ANTHROPIC_KEY = os.environ["ANTHROPIC_API_KEY"]
-NOTION_KEY = os.environ["NOTION_API_KEY"]
+NOTION_KEY    = os.environ["NOTION_API_KEY"]
 
 NOTION_DB = {
-    "location": "0fc117f5-c0e4-475b-8580-abd8232128bf",
-    "product":  "7403ac9b-cd75-481c-a6cf-71c2f3cefc44",
-    "article":  "fe9cc32d-ed19-40d9-a99f-ec69ae1d78e3",
-    "video":    "0e7bd3ac-9016-4d78-95bd-c6a30d14c70f",
-    "recipe":   "e630d63b-738c-4853-8ffc-cd51051b22d1",
-    "other":    "461f0e1c-f794-4fec-902a-277f0e220227",
+    "location": os.environ["NOTION_DB_LOCATION"],
+    "product":  os.environ["NOTION_DB_PRODUCT"],
+    "article":  os.environ["NOTION_DB_ARTICLE"],
+    "video":    os.environ["NOTION_DB_VIDEO"],
+    "recipe":   os.environ["NOTION_DB_RECIPE"],
+    "other":    os.environ["NOTION_DB_OTHER"],
 }
 
 CATEGORY_EMOJI = {
@@ -25,9 +25,11 @@ CATEGORY_EMOJI = {
     "other":    "📌",
 }
 
+
 class LinkRequest(BaseModel):
     url: str
-    note: str = ""  # optional extra note from user
+    note: str = ""
+
 
 async def classify(url: str, note: str) -> dict:
     prompt = (
@@ -88,7 +90,7 @@ async def save_to_notion(url: str, category: str, name: str, notes: str) -> str:
     return r.json()["url"]
 
 
-@app.post("/classify")
+@app.post("/api/classify")
 async def classify_link(req: LinkRequest):
     try:
         result = await classify(req.url, req.note)
@@ -117,6 +119,6 @@ async def classify_link(req: LinkRequest):
     }
 
 
-@app.get("/health")
+@app.get("/api/health")
 async def health():
     return {"ok": True}
