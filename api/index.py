@@ -4,7 +4,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
-GEMINI_KEY = os.environ["GEMINI_API_KEY"]
+GROQ_KEY = os.environ["GROQ_API_KEY"]
 NOTION_KEY    = os.environ["NOTION_API_KEY"]
 SECRET_KEY    = os.environ["SECRET_KEY"]
 
@@ -50,15 +50,19 @@ async def classify(url: str, note: str) -> dict:
 
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}",
-            headers={"Content-Type": "application/json"},
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_KEY}",
+                "Content-Type": "application/json",
+            },
             json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"maxOutputTokens": 256},
+                "model": "llama-3.1-8b-instant",
+                "max_tokens": 256,
+                "messages": [{"role": "user", "content": prompt}],
             },
         )
     r.raise_for_status()
-    text = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+    text = r.json()["choices"][0]["message"]["content"].strip()
     return json.loads(text)
 
 
@@ -94,7 +98,7 @@ async def classify_link(req: LinkRequest, authorization: str = Header(...)):
     try:
         result = await classify(req.url, req.note)
     except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Gemini error: {e}")
+        raise HTTPException(status_code=502, detail=f"Groq error: {e}")
 
     category = result.get("category", "other").lower()
     if category not in NOTION_DB:
