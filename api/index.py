@@ -132,6 +132,7 @@ async def save_log(url: str, note: str, forced: str | None, ai_category: str, fi
 @app.post("/api/classify")
 async def classify_link(req: LinkRequest, authorization: str = Header(...), note: str = ""):
     if not secrets.compare_digest(authorization, f"Bearer {SECRET_KEY}"):
+        await save_log(req.url, "", None, "", "error", "", "401 Unauthorized")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     # note can come from JSON body or query param
@@ -161,7 +162,7 @@ async def classify_link(req: LinkRequest, authorization: str = Header(...), note
         await save_log(req.url, combined_note, forced_category, ai_category, category, name, f"Notion error: {e}")
         raise HTTPException(status_code=502, detail=f"Notion error: {e}")
 
-    await save_log(req.url, combined_note, forced_category, ai_category, category, name, "success")
+    await save_log(req.url, combined_note, forced_category, ai_category, category, name, "✓ success")
 
     emoji = CATEGORY_EMOJI[category]
     return {
