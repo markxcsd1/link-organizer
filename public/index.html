@@ -167,7 +167,7 @@
         ? (l.forced ? `<code>!${l.forced}</code> ${escHtml(l.note)}` : escHtml(l.note))
         : (l.forced ? `<code>!${l.forced}</code>` : '<span style="color:#8e8e93">—</span>');
       const aiPicked = badge(l.ai_category) + (l.forced ? `<span class="forced-tag">(overridden)</span>` : '');
-      const statusBadge = l.status === 'success'
+      const statusBadge = l.status.includes('success')
         ? '<span class="badge badge-success">✓ saved</span>'
         : `<span class="badge badge-error" title="${escHtml(l.status)}">✗ error</span>`;
       return `<tr>
