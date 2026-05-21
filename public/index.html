@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Link Organizer — Logs</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f7; color: #1d1d1f; min-height: 100vh; }
+
+    /* Auth screen */
+    #auth-screen {
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      min-height: 100vh; gap: 16px;
+    }
+    #auth-screen h1 { font-size: 22px; font-weight: 600; }
+    #auth-screen input {
+      width: 320px; padding: 10px 14px; border: 1px solid #d2d2d7; border-radius: 10px;
+      font-size: 15px; outline: none;
+    }
+    #auth-screen input:focus { border-color: #0071e3; }
+    #auth-screen button {
+      width: 320px; padding: 10px; background: #0071e3; color: #fff; border: none;
+      border-radius: 10px; font-size: 15px; font-weight: 500; cursor: pointer;
+    }
+    #auth-screen button:hover { background: #0077ed; }
+    #auth-error { color: #ff3b30; font-size: 14px; }
+
+    /* Main screen */
+    #main-screen { display: none; padding: 32px 24px; max-width: 1100px; margin: 0 auto; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; }
+    header h1 { font-size: 22px; font-weight: 600; }
+    header div { display: flex; gap: 12px; align-items: center; }
+    #status { font-size: 13px; color: #6e6e73; }
+    button.secondary {
+      padding: 7px 14px; background: #fff; border: 1px solid #d2d2d7;
+      border-radius: 8px; font-size: 14px; cursor: pointer;
+    }
+    button.secondary:hover { background: #f5f5f7; }
+
+    /* Table */
+    .table-wrap { background: #fff; border-radius: 12px; overflow: auto; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; padding: 10px 14px; font-weight: 600; color: #6e6e73; border-bottom: 1px solid #e5e5ea; white-space: nowrap; }
+    td { padding: 10px 14px; border-bottom: 1px solid #f2f2f7; vertical-align: top; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #fafafa; }
+
+    .url-cell { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .url-cell a { color: #0071e3; text-decoration: none; }
+    .url-cell a:hover { text-decoration: underline; }
+
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 20px;
+      font-size: 12px; font-weight: 500; white-space: nowrap;
+    }
+    .badge-location  { background: #e8f4fd; color: #0064c8; }
+    .badge-product   { background: #fef3e2; color: #b45309; }
+    .badge-article   { background: #f0fdf4; color: #166534; }
+    .badge-video     { background: #fdf2f8; color: #86198f; }
+    .badge-recipe    { background: #fff7ed; color: #c2410c; }
+    .badge-other     { background: #f3f4f6; color: #374151; }
+    .badge-success   { background: #f0fdf4; color: #166534; }
+    .badge-error     { background: #fef2f2; color: #dc2626; }
+
+    .forced-tag { font-size: 11px; color: #8e8e93; margin-left: 4px; }
+    .empty { text-align: center; padding: 48px; color: #6e6e73; }
+  </style>
+</head>
+<body>
+
+<!-- Auth -->
+<div id="auth-screen">
+  <h1>Link Organizer</h1>
+  <input id="key-input" type="password" placeholder="Enter your SECRET_KEY" />
+  <button onclick="login()">Sign in</button>
+  <span id="auth-error"></span>
+</div>
+
+<!-- Dashboard -->
+<div id="main-screen">
+  <header>
+    <h1>Link Organizer — Activity Log</h1>
+    <div>
+      <span id="status"></span>
+      <button class="secondary" onclick="loadLogs()">Refresh</button>
+      <button class="secondary" onclick="logout()">Sign out</button>
+    </div>
+  </header>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Name / URL</th>
+          <th>Command sent</th>
+          <th>AI picked</th>
+          <th>Saved as</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="log-body">
+        <tr><td colspan="6" class="empty">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  const EMOJIS = { location:'📍', product:'🛍️', article:'📖', video:'🎬', recipe:'🍳', other:'📌' };
+  let secretKey = sessionStorage.getItem('secret_key') || '';
+
+  if (secretKey) attemptShow();
+
+  async function login() {
+    secretKey = document.getElementById('key-input').value.trim();
+    document.getElementById('auth-error').textContent = '';
+    if (!secretKey) return;
+    const ok = await attemptShow();
+    if (!ok) document.getElementById('auth-error').textContent = 'Invalid key.';
+  }
+
+  async function attemptShow() {
+    const res = await fetchLogs();
+    if (!res) return false;
+    sessionStorage.setItem('secret_key', secretKey);
+    document.getElementById('auth-screen').style.display = 'none';
+    document.getElementById('main-screen').style.display = 'block';
+    render(res.logs);
+    return true;
+  }
+
+  async function fetchLogs() {
+    try {
+      const r = await fetch('/api/logs', { headers: { 'Authorization': 'Bearer ' + secretKey } });
+      if (!r.ok) return null;
+      return await r.json();
+    } catch { return null; }
+  }
+
+  async function loadLogs() {
+    document.getElementById('status').textContent = 'Refreshing…';
+    const res = await fetchLogs();
+    if (res) { render(res.logs); document.getElementById('status').textContent = 'Updated ' + new Date().toLocaleTimeString(); }
+    else document.getElementById('status').textContent = 'Error loading logs';
+  }
+
+  function logout() {
+    sessionStorage.removeItem('secret_key');
+    secretKey = '';
+    document.getElementById('main-screen').style.display = 'none';
+    document.getElementById('auth-screen').style.display = 'flex';
+    document.getElementById('key-input').value = '';
+  }
+
+  function render(logs) {
+    const tbody = document.getElementById('log-body');
+    if (!logs.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">No logs yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = logs.map(l => {
+      const time = new Date(l.time).toLocaleString([], { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit' });
+      const commandSent = l.note
+        ? (l.forced ? `<code>!${l.forced}</code> ${escHtml(l.note)}` : escHtml(l.note))
+        : (l.forced ? `<code>!${l.forced}</code>` : '<span style="color:#8e8e93">—</span>');
+      const aiPicked = badge(l.ai_category) + (l.forced ? `<span class="forced-tag">(overridden)</span>` : '');
+      const statusBadge = l.status === 'success'
+        ? '<span class="badge badge-success">✓ saved</span>'
+        : `<span class="badge badge-error" title="${escHtml(l.status)}">✗ error</span>`;
+      return `<tr>
+        <td style="white-space:nowrap;color:#6e6e73">${time}</td>
+        <td class="url-cell"><a href="${escHtml(l.url)}" target="_blank" title="${escHtml(l.url)}">${escHtml(l.name || l.url)}</a></td>
+        <td>${commandSent}</td>
+        <td>${aiPicked}</td>
+        <td>${badge(l.final_category)}</td>
+        <td>${statusBadge}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function badge(cat) {
+    if (!cat || cat === 'unknown') return '<span style="color:#8e8e93">—</span>';
+    const emoji = EMOJIS[cat] || '';
+    return `<span class="badge badge-${cat}">${emoji} ${cap(cat)}</span>`;
+  }
+
+  function cap(s) { return s.charAt(0).toUpperCase() + s.slice(1); }
+  function escHtml(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+  document.getElementById('key-input').addEventListener('keydown', e => { if (e.key === 'Enter') login(); });
+
+  // Auto-refresh every 30s
+  setInterval(() => { if (secretKey) loadLogs(); }, 30000);
+</script>
+</body>
+</html>
