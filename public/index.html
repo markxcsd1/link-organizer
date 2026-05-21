@@ -121,28 +121,30 @@
   }
 
   async function attemptShow() {
-    const res = await fetchLogs();
-    if (!res) return false;
+    const { data, status } = await fetchLogs();
+    if (status === 401) return false;
     sessionStorage.setItem('secret_key', secretKey);
     document.getElementById('auth-screen').style.display = 'none';
     document.getElementById('main-screen').style.display = 'block';
-    render(res.logs);
+    if (data) render(data.logs);
+    else document.getElementById('status').textContent = 'Error loading logs (check Notion connection)';
     return true;
   }
 
   async function fetchLogs() {
     try {
       const r = await fetch('/api/logs', { headers: { 'Authorization': 'Bearer ' + secretKey } });
-      if (!r.ok) return null;
-      return await r.json();
-    } catch { return null; }
+      if (r.status === 401) return { data: null, status: 401 };
+      if (!r.ok) return { data: null, status: r.status };
+      return { data: await r.json(), status: 200 };
+    } catch { return { data: null, status: 0 }; }
   }
 
   async function loadLogs() {
     document.getElementById('status').textContent = 'Refreshing…';
-    const res = await fetchLogs();
-    if (res) { render(res.logs); document.getElementById('status').textContent = 'Updated ' + new Date().toLocaleTimeString(); }
-    else document.getElementById('status').textContent = 'Error loading logs';
+    const { data, status } = await fetchLogs();
+    if (data) { render(data.logs); document.getElementById('status').textContent = 'Updated ' + new Date().toLocaleTimeString(); }
+    else document.getElementById('status').textContent = status === 401 ? 'Unauthorized' : 'Error loading logs (check Notion connection)';
   }
 
   function logout() {
