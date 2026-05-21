@@ -130,18 +130,20 @@ async def save_log(url: str, note: str, forced: str | None, ai_category: str, fi
 
 
 @app.post("/api/classify")
-async def classify_link(req: LinkRequest, authorization: str = Header(...)):
+async def classify_link(req: LinkRequest, authorization: str = Header(...), note: str = ""):
     if not secrets.compare_digest(authorization, f"Bearer {SECRET_KEY}"):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    forced_category, clean_note = parse_command(req.note)
+    # note can come from JSON body or query param
+    combined_note = req.note or note
+    forced_category, clean_note = parse_command(combined_note)
 
     ai_category = "unknown"
     try:
         result = await classify(req.url, clean_note)
         ai_category = result.get("category", "other").lower()
     except Exception as e:
-        await save_log(req.url, req.note, forced_category, ai_category, "error", "", f"Groq error: {e}")
+        await save_log(req.url, combined_note, forced_category, ai_category, "error", "", f"Groq error: {e}")
         raise HTTPException(status_code=502, detail=f"Groq error: {e}")
 
     category = forced_category or ai_category
@@ -156,10 +158,10 @@ async def classify_link(req: LinkRequest, authorization: str = Header(...)):
     try:
         notion_url = await save_to_notion(req.url, category, name, notes)
     except Exception as e:
-        await save_log(req.url, req.note, forced_category, ai_category, category, name, f"Notion error: {e}")
+        await save_log(req.url, combined_note, forced_category, ai_category, category, name, f"Notion error: {e}")
         raise HTTPException(status_code=502, detail=f"Notion error: {e}")
 
-    await save_log(req.url, req.note, forced_category, ai_category, category, name, "success")
+    await save_log(req.url, combined_note, forced_category, ai_category, category, name, "success")
 
     emoji = CATEGORY_EMOJI[category]
     return {
