@@ -165,9 +165,12 @@ async def classify_link(req: LinkRequest, authorization: str = Header(...), note
     await save_log(req.url, combined_note, forced_category, ai_category, category, name, "✓ success")
 
     emoji = CATEGORY_EMOJI[category]
+    message = f"{emoji} Saved to {category.title()}s\n{name}"
+    if clean_note:
+        message += f"\n📝 {clean_note}"
     return {
         "ok": True,
-        "message": f"{emoji} Saved to {category.title()}s\n{name}",
+        "message": message,
         "category": category,
         "name": name,
         "notion_url": notion_url,
