@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, json, re, secrets, uuid, httpx
+import os, json, re, secrets, uuid, asyncio, httpx
 from urllib.parse import unquote_plus
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
@@ -1490,41 +1490,60 @@ async def handle_chat(chat_id: int, text: str):
         CHAT_HISTORY[chat_id] = history[-MAX_HISTORY:]
     history = CHAT_HISTORY[chat_id]
 
-    # Extract search keywords from the FULL conversation context, not just the current message
-    # This handles follow-ups like "And then?" or "What about after that?"
+    # Extract TWO search angles in parallel and union the results.
+    # - question_kw: keywords from the current question (catches direct title matches)
+    # - topic_kw:    main subject of conversation (catches follow-ups like "And then?" / "How much?")
+    # Notion's search API does NOT reliably index content inside table blocks, so a question like
+    # "How much is the ferry?" by itself rarely finds the right page; the topic search is what
+    # gets us to the trip page where we can then read tables + parents + siblings.
     conversation_context = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in history[-6:])
-    search_query = text
-    try:
-        kw = await groq_chat([{"role": "user", "content":
-            f"Based on this conversation, extract 2-4 Notion search keywords that would find relevant content.\n"
-            f"Focus on the TOPIC being discussed (places, events, dates, names), not filler words.\n"
-            f"Return ONLY the keywords, nothing else.\n\n"
-            f"Conversation:\n{conversation_context}"}],
-            max_tokens=40)
-        if kw:
-            search_query = kw.strip()
-    except Exception:
-        pass
 
-    # Search Notion with extracted keywords.
-    # If the current question yields no results (e.g. "ferry price" doesn't match page text),
-    # retry with the broader topic from conversation history — the user's question may use
-    # different words than what's written in Notion.
-    context_lines = []
-    notion_results = []
+    async def _extract_kw(prompt: str, max_tokens: int) -> str:
+        try:
+            out = await groq_chat([{"role": "user", "content": prompt}], max_tokens=max_tokens)
+            return (out or "").strip()
+        except Exception:
+            return ""
+
+    question_prompt = (
+        "Based on this conversation, extract 2-4 Notion search keywords that would find relevant content.\n"
+        "Focus on the TOPIC being discussed (places, events, dates, names), not filler words.\n"
+        "Return ONLY the keywords, nothing else.\n\n"
+        f"Conversation:\n{conversation_context}"
+    )
+    topic_prompt = (
+        "What is the main subject of this conversation? "
+        "Return 1-3 keywords that best describe the SUBJECT (e.g. 'Summer 2026 trip', 'concert', 'recipe'), "
+        "not the latest question. Return ONLY the keywords, nothing else.\n\n"
+        f"{conversation_context}"
+    )
+
+    question_kw, topic_kw = await asyncio.gather(
+        _extract_kw(question_prompt, 40),
+        _extract_kw(topic_prompt, 20),
+    )
+    question_kw = question_kw or text
+    queries = [q for q in {question_kw, topic_kw} if q]
+
+    # Run all searches in parallel, union by id preserving order
+    notion_results: list = []
+    context_lines: list = []
     try:
-        notion_results = await notion_search(search_query)
-        if not notion_results and conversation_context:
-            topic_kw = await groq_chat([{"role": "user", "content":
-                f"What is the main topic of this conversation? "
-                f"Return 1-3 keywords that best describe the SUBJECT (not the question itself). "
-                f"Return ONLY the keywords, nothing else.\n\n{conversation_context}"}],
-                max_tokens=20)
-            if topic_kw and topic_kw.strip():
-                notion_results = await notion_search(topic_kw.strip())
+        search_results = await asyncio.gather(
+            *[notion_search(q) for q in queries], return_exceptions=True
+        )
+        seen_ids: set = set()
+        for res in search_results:
+            if isinstance(res, Exception):
+                continue
+            for r in res:
+                rid = r.get("id", "")
+                if rid and rid not in seen_ids:
+                    seen_ids.add(rid)
+                    notion_results.append(r)
         if notion_results:
             context_lines.append("Relevant Notion pages found:")
-            for r in notion_results[:6]:
+            for r in notion_results[:8]:
                 line = f"- {r['title']}"
                 if r.get("url"):
                     line += f" ({r['url']})"
@@ -1532,11 +1551,14 @@ async def handle_chat(chat_id: int, text: str):
     except Exception:
         pass
 
-    # Read the CONTENT of the top 3 most relevant pages
+    # Diagnostic log line — one per question, visible in Vercel logs
+    print(f"[chat] queries={queries!r} top={[r.get('title','') for r in notion_results[:5]]}")
+
+    # Read the CONTENT of the top relevant pages (up to 4)
     # For databases (island/trip DBs), query rows instead of reading page blocks
     pages_read = 0
-    for page in notion_results[:3]:
-        if not page.get("id") or pages_read >= 3:
+    for page in notion_results[:6]:
+        if not page.get("id") or pages_read >= 4:
             continue
         try:
             if page.get("object") == "database":
@@ -1562,7 +1584,7 @@ async def handle_chat(chat_id: int, text: str):
     # e.g. "Amorgos" DB lives inside "Summer 2026" → read Summer 2026 content + all sibling pages (Rhodes, Italy…)
     seen_parents: set = set()
     seen_children: set = set(p.get("id", "") for p in notion_results)
-    for page in notion_results[:3]:
+    for page in notion_results[:6]:
         if not page.get("id"):
             continue
         try:
@@ -1632,6 +1654,7 @@ async def handle_chat(chat_id: int, text: str):
         pass
 
     knowledge_context = "\n".join(context_lines) if context_lines else "No items found in Notion."
+    print(f"[chat] knowledge_chars={len(knowledge_context)} ctx_lines={len(context_lines)}")
 
     system = (
         "You are a personal knowledge assistant with direct access to the user's Notion.\n\n"
@@ -1764,4 +1787,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "9a9ec71"}
+    return {"ok": True, "v": "dual-search"}
