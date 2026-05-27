@@ -1,14 +1,14 @@
-import os, json, secrets, httpx
+import os, json, re, secrets, httpx
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 
 app = FastAPI()
 
-GROQ_KEY          = os.environ["GROQ_API_KEY"]
-NOTION_KEY        = os.environ["NOTION_API_KEY"]
-SECRET_KEY        = os.environ["SECRET_KEY"]
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_USER_ID  = os.environ.get("TELEGRAM_USER_ID", "")
+GROQ_KEY         = os.environ["GROQ_API_KEY"]
+NOTION_KEY       = os.environ["NOTION_API_KEY"]
+SECRET_KEY       = os.environ["SECRET_KEY"]
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_USER_ID = os.environ.get("TELEGRAM_USER_ID", "")
 
 NOTION_DB = {
     "location": os.environ["NOTION_DB_LOCATION"],
@@ -36,14 +36,36 @@ NOTION_HEADERS = {
     "Content-Type": "application/json",
 }
 
+HELP_TEXT = """*Your personal knowledge assistant* 🧠
 
-class LinkRequest(BaseModel):
-    url: str
-    note: str = ""
+*Save a link:*
+Just send any URL — I'll classify and save it automatically\\.
+Add a note: `https://example\\.com great article`
+Force category: `https://example\\.com !video`
 
+*Search your knowledge:*
+`/search <query>` — search across all your Notion databases
+
+*Recent saves:*
+`/list` — show last 10 saves
+`/list articles` — filter by category
+
+*Create a note:*
+`/note <title>` — create a note in Notion \\(syncs to Obsidian\\)
+`/note Meeting recap: we decided to...`
+
+*Chat:*
+Just talk to me — I know about your saved content and can help you think through things\\.
+
+*Categories:* 📍 location · 🛍️ product · 📖 article · 🎬 video · 🍳 recipe · 📌 other"""
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _rich_text(value: str) -> list:
+    return [{"text": {"content": value[:2000]}}]
 
 def parse_command(note: str) -> tuple:
-    """Extract !category override from note. Returns (forced_category | None, clean_note)."""
     note = note.strip()
     if note.startswith("!"):
         parts = note.split(None, 1)
@@ -53,12 +75,30 @@ def parse_command(note: str) -> tuple:
             return cmd, clean_note
     return None, note
 
+async def tg_send(chat_id: int, text: str):
+    if not TELEGRAM_TOKEN:
+        return
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown",
+                  "disable_web_page_preview": True},
+        )
 
-def _rich_text(value: str) -> list:
-    return [{"text": {"content": value[:2000]}}]
+async def groq_chat(messages: list, max_tokens: int = 512) -> str:
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
+            json={"model": "llama-3.1-8b-instant", "max_tokens": max_tokens, "messages": messages},
+        )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"].strip()
 
 
-async def classify(url: str, note: str) -> dict:
+# ── Notion operations ─────────────────────────────────────────────────────────
+
+async def notion_classify_and_save(url: str, note: str) -> dict:
     prompt = (
         f"Classify this URL into exactly one category and extract a short title.\n"
         f"URL: {url}\n"
@@ -73,31 +113,10 @@ async def classify(url: str, note: str) -> dict:
         f"Return ONLY valid JSON, no markdown:\n"
         f'{{ "category": "...", "name": "page title or place name", "notes": "one sentence description" }}'
     )
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": "llama-3.1-8b-instant",
-                "max_tokens": 256,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-        )
-    r.raise_for_status()
-    text = r.json()["choices"][0]["message"]["content"].strip()
+    text = await groq_chat([{"role": "user", "content": prompt}], max_tokens=256)
     return json.loads(text)
 
-
-async def save_to_notion(url: str, category: str, name: str, notes: str) -> str:
-    db_id = NOTION_DB.get(category, NOTION_DB["other"])
-    properties: dict = {
-        "Name": {"title": [{"text": {"content": name or url}}]},
-        "URL":  {"url": url},
-    }
-    if notes:
-        properties["Notes"] = {"rich_text": _rich_text(notes)}
-
+async def notion_save_page(db_id: str, properties: dict) -> str:
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
             "https://api.notion.com/v1/pages",
@@ -107,76 +126,243 @@ async def save_to_notion(url: str, category: str, name: str, notes: str) -> str:
     r.raise_for_status()
     return r.json()["url"]
 
+async def notion_search(query: str) -> list:
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            "https://api.notion.com/v1/search",
+            headers=NOTION_HEADERS,
+            json={"query": query, "page_size": 8,
+                  "filter": {"value": "page", "property": "object"}},
+        )
+    r.raise_for_status()
+    results = []
+    for page in r.json().get("results", []):
+        props = page.get("properties", {})
+        title_items = props.get("Name", {}).get("title", [])
+        title = title_items[0]["text"]["content"] if title_items else "Untitled"
+        url = props.get("URL", {}).get("url", "")
+        results.append({"title": title, "url": url, "notion_url": page["url"]})
+    return results
 
-async def save_log(url: str, note: str, forced: str | None, ai_category: str, final_category: str, name: str, status: str):
+async def notion_list_recent(category: str | None = None, limit: int = 10) -> list:
+    db_ids = [NOTION_DB[category]] if category and category in NOTION_DB else list(NOTION_DB.values())
+    pages = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        for db_id in db_ids:
+            r = await client.post(
+                f"https://api.notion.com/v1/databases/{db_id}/query",
+                headers=NOTION_HEADERS,
+                json={"sorts": [{"timestamp": "created_time", "direction": "descending"}],
+                      "page_size": limit},
+            )
+            if r.status_code == 200:
+                for page in r.json().get("results", []):
+                    props = page.get("properties", {})
+                    title_items = props.get("Name", {}).get("title", [])
+                    title = title_items[0]["text"]["content"] if title_items else "Untitled"
+                    url = props.get("URL", {}).get("url", "")
+                    # find which category this db belongs to
+                    cat = next((k for k, v in NOTION_DB.items() if v == db_id), "other")
+                    pages.append({
+                        "title": title, "url": url,
+                        "notion_url": page["url"],
+                        "category": cat,
+                        "time": page["created_time"][:10],
+                    })
+    pages.sort(key=lambda x: x["time"], reverse=True)
+    return pages[:limit]
+
+async def save_log(url: str, note: str, forced: str | None, ai_category: str,
+                   final_category: str, name: str, status: str):
     if not NOTION_DB_LOGS:
         return
     try:
         properties = {
-            "Name":             {"title": [{"text": {"content": (name or url)[:200]}}]},
-            "URL":              {"url": url},
-            "Note":             {"rich_text": _rich_text(note)},
-            "Forced Category":  {"rich_text": _rich_text(forced or "")},
-            "AI Category":      {"rich_text": _rich_text(ai_category)},
-            "Final Category":   {"rich_text": _rich_text(final_category)},
-            "Status":           {"rich_text": _rich_text(status)},
+            "Name":            {"title": [{"text": {"content": (name or url)[:200]}}]},
+            "URL":             {"url": url or "https://placeholder.com"},
+            "Note":            {"rich_text": _rich_text(note)},
+            "Forced Category": {"rich_text": _rich_text(forced or "")},
+            "AI Category":     {"rich_text": _rich_text(ai_category)},
+            "Final Category":  {"rich_text": _rich_text(final_category)},
+            "Status":          {"rich_text": _rich_text(status)},
         }
         async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
-                "https://api.notion.com/v1/pages",
-                headers=NOTION_HEADERS,
-                json={"parent": {"database_id": NOTION_DB_LOGS}, "properties": properties},
-            )
+            await client.post("https://api.notion.com/v1/pages",
+                              headers=NOTION_HEADERS,
+                              json={"parent": {"database_id": NOTION_DB_LOGS},
+                                    "properties": properties})
     except Exception:
         pass
 
 
-@app.post("/api/classify")
-async def classify_link(req: LinkRequest, authorization: str = Header(...), note: str = ""):
-    if not secrets.compare_digest(authorization, f"Bearer {SECRET_KEY}"):
-        await save_log(req.url, "", None, "", "error", "", "401 Unauthorized")
-        raise HTTPException(status_code=401, detail="Unauthorized")
+# ── Bot handlers ──────────────────────────────────────────────────────────────
 
-    # note can come from JSON body or query param
-    combined_note = req.note or note
-    forced_category, clean_note = parse_command(combined_note)
-
+async def handle_save_link(chat_id: int, url: str, note: str):
+    forced_category, clean_note = parse_command(note)
+    await tg_send(chat_id, "🔍 Classifying…")
     ai_category = "unknown"
     try:
-        result = await classify(req.url, clean_note)
+        result = await notion_classify_and_save(url, clean_note)
         ai_category = result.get("category", "other").lower()
     except Exception as e:
-        await save_log(req.url, combined_note, forced_category, ai_category, "error", "", f"Groq error: {e}")
-        raise HTTPException(status_code=502, detail=f"Groq error: {e}")
+        await tg_send(chat_id, f"❌ Classification failed: {e}")
+        await save_log(url, note, forced_category, ai_category, "error", "", str(e))
+        return
 
     category = forced_category or ai_category
     if category not in NOTION_DB:
         category = "other"
 
-    name  = result.get("name", "")[:200]
-    notes = result.get("notes", "")[:500]
+    name       = result.get("name", "")[:200]
+    notes_text = result.get("notes", "")[:500]
     if clean_note:
-        notes = (clean_note + (" — " + notes if notes else ""))[:500]
+        notes_text = (clean_note + (" — " + notes_text if notes_text else ""))[:500]
 
     try:
-        notion_url = await save_to_notion(req.url, category, name, notes)
+        notion_url = await notion_save_page(NOTION_DB[category], {
+            "Name": {"title": [{"text": {"content": name or url}}]},
+            "URL":  {"url": url},
+            **({"Notes": {"rich_text": _rich_text(notes_text)}} if notes_text else {}),
+        })
     except Exception as e:
-        await save_log(req.url, combined_note, forced_category, ai_category, category, name, f"Notion error: {e}")
-        raise HTTPException(status_code=502, detail=f"Notion error: {e}")
+        await tg_send(chat_id, f"❌ Failed to save to Notion: {e}")
+        await save_log(url, note, forced_category, ai_category, category, name, str(e))
+        return
 
-    await save_log(req.url, combined_note, forced_category, ai_category, category, name, "✓ success")
-
+    await save_log(url, note, forced_category, ai_category, category, name, "✓ success")
     emoji = CATEGORY_EMOJI[category]
-    message = f"{emoji} Saved to {category.title()}s\n{name}"
-    if clean_note:
-        message += f"\n📝 {clean_note}"
-    return {
-        "ok": True,
-        "message": message,
-        "category": category,
-        "name": name,
-        "notion_url": notion_url,
-    }
+    forced_tag = " _(forced)_" if forced_category else ""
+    reply = f"{emoji} *Saved to {category.title()}s*{forced_tag}\n*{name}*"
+    if notes_text:
+        reply += f"\n📝 {notes_text}"
+    reply += f"\n\n[Open in Notion]({notion_url})"
+    await tg_send(chat_id, reply)
+
+
+async def handle_search(chat_id: int, query: str):
+    await tg_send(chat_id, f"🔍 Searching for *{query}*…")
+    try:
+        results = await notion_search(query)
+    except Exception as e:
+        await tg_send(chat_id, f"❌ Search failed: {e}")
+        return
+    if not results:
+        await tg_send(chat_id, f"No results found for *{query}*\\.")
+        return
+    lines = [f"*Results for \"{query}\":*\n"]
+    for r in results:
+        emoji = "🔗"
+        line = f"{emoji} [{r['title']}]({r['notion_url']})"
+        if r.get("url"):
+            line += f" — [source]({r['url']})"
+        lines.append(line)
+    await tg_send(chat_id, "\n".join(lines))
+
+
+async def handle_list(chat_id: int, category: str | None = None):
+    label = category.title() if category else "all"
+    await tg_send(chat_id, f"📋 Loading recent saves…")
+    try:
+        pages = await notion_list_recent(category, limit=10)
+    except Exception as e:
+        await tg_send(chat_id, f"❌ Failed to fetch: {e}")
+        return
+    if not pages:
+        await tg_send(chat_id, "Nothing saved yet\\.")
+        return
+    lines = [f"*Recent saves ({label}):*\n"]
+    for p in pages:
+        emoji = CATEGORY_EMOJI.get(p["category"], "📌")
+        lines.append(f"{emoji} [{p['title']}]({p['notion_url']}) — _{p['time']}_")
+    await tg_send(chat_id, "\n".join(lines))
+
+
+async def handle_create_note(chat_id: int, content: str):
+    # Split title from body if user uses "Title: body" format
+    if ":" in content:
+        title, body = content.split(":", 1)
+        title, body = title.strip(), body.strip()
+    else:
+        title = content[:60].rstrip()
+        body = content
+
+    try:
+        notion_url = await notion_save_page(NOTION_DB["other"], {
+            "Name":  {"title": [{"text": {"content": title}}]},
+            "URL":   {"url": "https://placeholder.com"},
+            "Notes": {"rich_text": _rich_text(body)},
+        })
+    except Exception as e:
+        await tg_send(chat_id, f"❌ Failed to save note: {e}")
+        return
+
+    await tg_send(chat_id,
+        f"📝 *Note saved*\n*{title}*\n\n[Open in Notion]({notion_url})\n\n"
+        f"_Run `sync\\_obsidian.py` to sync to Obsidian_")
+
+
+async def handle_chat(chat_id: int, text: str):
+    system = (
+        "You are a personal knowledge assistant. The user has a personal knowledge base with:\n"
+        "- Notion databases: locations, products, articles, videos, recipes, and other/notes\n"
+        "- Obsidian vault synced from Notion articles (synced manually)\n\n"
+        "You help them save, find, and think about their saved content. "
+        "Be concise and helpful. If they ask about their saved content you can't directly access "
+        "right now, suggest they use /search or /list to find it. "
+        "Keep responses under 200 words. Use plain text, no markdown."
+    )
+    try:
+        response = await groq_chat([
+            {"role": "system", "content": system},
+            {"role": "user", "content": text},
+        ])
+        await tg_send(chat_id, response)
+    except Exception as e:
+        await tg_send(chat_id, f"❌ Error: {e}")
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.post("/api/telegram")
+async def telegram_webhook(req: Request):
+    data = await req.json()
+    message = data.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    user_id = str(message.get("from", {}).get("id", ""))
+    text    = message.get("text", "").strip()
+
+    if user_id != TELEGRAM_USER_ID:
+        return {"ok": True}
+    if not text or not chat_id:
+        return {"ok": True}
+
+    # Commands
+    if text in ("/start", "/help"):
+        await tg_send(chat_id, HELP_TEXT)
+
+    elif text.startswith("/search "):
+        await handle_search(chat_id, text[8:].strip())
+
+    elif text.startswith("/list"):
+        parts = text.split(None, 1)
+        category = parts[1].strip().lower() if len(parts) > 1 else None
+        # normalize plural → singular
+        if category and category.endswith("s"):
+            category = category[:-1]
+        await handle_list(chat_id, category if category in NOTION_DB else None)
+
+    elif text.startswith("/note "):
+        await handle_create_note(chat_id, text[6:].strip())
+
+    elif re.search(r'https?://\S+', text):
+        url = re.search(r'https?://\S+', text).group(0)
+        note = text.replace(url, "").strip()
+        await handle_save_link(chat_id, url, note)
+
+    else:
+        await handle_chat(chat_id, text)
+
+    return {"ok": True}
 
 
 @app.get("/api/logs")
@@ -190,7 +376,8 @@ async def get_logs(authorization: str = Header(...)):
         r = await client.post(
             f"https://api.notion.com/v1/databases/{NOTION_DB_LOGS}/query",
             headers=NOTION_HEADERS,
-            json={"sorts": [{"timestamp": "created_time", "direction": "descending"}], "page_size": 50},
+            json={"sorts": [{"timestamp": "created_time", "direction": "descending"}],
+                  "page_size": 50},
         )
     r.raise_for_status()
 
@@ -212,90 +399,6 @@ async def get_logs(authorization: str = Header(...)):
             "name":           (p.get("Name", {}).get("title") or [{}])[0].get("text", {}).get("content", ""),
         })
     return {"ok": True, "logs": logs}
-
-
-async def tg_send(chat_id: int, text: str):
-    if not TELEGRAM_TOKEN:
-        return
-    async with httpx.AsyncClient(timeout=10) as client:
-        await client.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True},
-        )
-
-
-@app.post("/api/telegram")
-async def telegram_webhook(req: Request):
-    data = await req.json()
-
-    message = data.get("message", {})
-    chat_id = message.get("chat", {}).get("id")
-    user_id = str(message.get("from", {}).get("id", ""))
-    text    = message.get("text", "").strip()
-
-    # Security: ignore anyone who isn't you
-    if user_id != TELEGRAM_USER_ID:
-        return {"ok": True}
-
-    if not text:
-        return {"ok": True}
-
-    # Extract URL — first word that starts with http
-    parts = text.split()
-    url = next((p for p in parts if p.startswith("http")), None)
-
-    if not url:
-        await tg_send(chat_id, (
-            "Send me a link to save it\\. You can also add a note or force a category:\n\n"
-            "`https://example.com` — auto classify\n"
-            "`https://example.com !video` — force category\n"
-            "`https://example.com birthday gift` — add a note\n"
-            "`https://example.com !product birthday gift` — both"
-        ))
-        return {"ok": True}
-
-    # Everything except the URL is the note/command
-    note = text.replace(url, "").strip()
-    forced_category, clean_note = parse_command(note)
-
-    await tg_send(chat_id, "🔍 Classifying\\.\\.\\.")
-
-    ai_category = "unknown"
-    try:
-        result = await classify(url, clean_note)
-        ai_category = result.get("category", "other").lower()
-    except Exception as e:
-        await tg_send(chat_id, f"❌ Error classifying: {e}")
-        await save_log(url, note, forced_category, ai_category, "error", "", f"Groq error: {e}")
-        return {"ok": True}
-
-    category = forced_category or ai_category
-    if category not in NOTION_DB:
-        category = "other"
-
-    name       = result.get("name", "")[:200]
-    notes_text = result.get("notes", "")[:500]
-    if clean_note:
-        notes_text = (clean_note + (" — " + notes_text if notes_text else ""))[:500]
-
-    try:
-        notion_url = await save_to_notion(url, category, name, notes_text)
-    except Exception as e:
-        await tg_send(chat_id, f"❌ Error saving to Notion: {e}")
-        await save_log(url, note, forced_category, ai_category, category, name, f"Notion error: {e}")
-        return {"ok": True}
-
-    await save_log(url, note, forced_category, ai_category, category, name, "✓ success")
-
-    emoji = CATEGORY_EMOJI[category]
-    forced_note = f" _(category forced)_" if forced_category else ""
-    reply = f"{emoji} *Saved to {category.title()}s*{forced_note}\n*{name}*"
-    if notes_text:
-        reply += f"\n📝 {notes_text}"
-    reply += f"\n\n[Open in Notion]({notion_url})"
-
-    await tg_send(chat_id, reply)
-    return {"ok": True}
 
 
 @app.get("/api/health")
