@@ -533,6 +533,73 @@ async def handle_callback_query(cq: dict):
         await tg_edit_buttons(chat_id, message_id, reply)
 
 
+async def handle_pending_modification(chat_id: int, text: str, pid: str, pending: dict):
+    """Interpret free-text input as a modification to a pending save."""
+    current = json.dumps({
+        "name": pending.get("name", ""),
+        "category": pending.get("category", ""),
+        "notes": pending.get("notes", ""),
+    })
+    prompt = (
+        f"The user has a pending save action:\n{current}\n\n"
+        f"The user said: \"{text}\"\n\n"
+        f"Determine their intent. Return ONLY valid JSON:\n"
+        f'{{"action": "save", "category": "...", "name": "...", "notes": "..."}}\n'
+        f"action must be one of: save, cancel, modify\n"
+        f"- save: user said ok/yes/save/go ahead — keep all current values\n"
+        f"- cancel: user wants to cancel\n"
+        f"- modify: user wants to change something — update only the mentioned fields, keep others unchanged\n"
+        f"Valid categories: location, product, article, video, recipe, other"
+    )
+    try:
+        raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=200)
+        raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
+        raw = re.sub(r"```$", "", raw.strip())
+        m = re.search(r"\{.*\}", raw, re.DOTALL)
+        result = json.loads(m.group(0) if m else raw)
+    except Exception:
+        await tg_send(chat_id, "Didn't understand that — use the buttons or say *save*, *cancel*, or describe a change.")
+        return
+
+    action = result.get("action", "modify")
+
+    if action == "cancel":
+        PENDING.pop(pid, None)
+        await tg_send(chat_id, "❌ Cancelled.")
+        return
+
+    if action in ("save",):
+        PENDING.pop(pid, None)
+        await _do_save_link(chat_id, pending)
+        return
+
+    # modify — update whichever fields changed
+    new_cat = result.get("category", "").lower()
+    if new_cat and new_cat in NOTION_DB:
+        pending["category"] = new_cat
+        pending["forced"] = new_cat
+    if result.get("name"):
+        pending["name"] = result["name"]
+    if result.get("notes") is not None and result["notes"] != pending.get("notes"):
+        pending["notes"] = result["notes"]
+
+    emoji = CATEGORY_EMOJI.get(pending["category"], "📌")
+    preview = (
+        f"*Updated*\n\n"
+        f"*{pending['name']}*\n"
+        f"{emoji} Category: *{pending['category'].title()}*\n\n"
+        f"{pending['notes']}\n\n"
+        f"Save to Notion?\n\n"
+        f"_Or keep describing changes._"
+    )
+    keyboard = [[
+        {"text": "✅ Save",            "callback_data": f"save:{pid}"},
+        {"text": "🔄 Change category", "callback_data": f"change:{pid}"},
+        {"text": "❌ Cancel",          "callback_data": f"cancel:{pid}"},
+    ]]
+    await tg_send_buttons(chat_id, preview, keyboard)
+
+
 async def handle_search(chat_id: int, query: str):
     await tg_send(chat_id, f"🔍 Searching for *{query}*…")
     lines = [f"*Results for \"{query}\":*\n"]
@@ -707,7 +774,16 @@ async def telegram_webhook(req: Request):
         await handle_save_link(chat_id, url, note)
 
     else:
-        await handle_chat(chat_id, text)
+        # If there's a pending action waiting, treat this as a modification request
+        pending_entry = next(
+            ((pid, p) for pid, p in PENDING.items() if p.get("chat_id") == chat_id),
+            None,
+        )
+        if pending_entry:
+            pid, pending = pending_entry
+            await handle_pending_modification(chat_id, text, pid, pending)
+        else:
+            await handle_chat(chat_id, text)
 
     return {"ok": True}
 
