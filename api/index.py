@@ -156,7 +156,7 @@ async def fetch_page_meta(url: str) -> dict:
 # ── Notion operations ─────────────────────────────────────────────────────────
 
 async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
-    """Ask Groq to classify and summarise a link, using real page metadata."""
+    """Deep analysis: understand the SUBJECT of the content, not just its format."""
     meta_text = ""
     if meta.get("title"):
         meta_text += f"Page title: {meta['title']}\n"
@@ -164,25 +164,28 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
         meta_text += f"Page description: {meta['desc']}\n"
 
     prompt = (
-        f"Analyse this URL for a personal knowledge base.\n"
+        f"Analyse this link for a personal knowledge base. Think about the SUBJECT, not the medium.\n"
         f"URL: {url}\n"
         f"{meta_text}"
         f"{'User note: ' + note if note else ''}\n\n"
-        f"Categories:\n"
-        f"- location: Google Maps, Apple Maps, addresses, places, restaurants, hotels\n"
-        f"- product: Amazon, shopping, e-commerce, any item for sale\n"
-        f"- video: YouTube, TikTok, Vimeo, Reels, any video content\n"
-        f"- recipe: cooking recipes, food blogs with recipes\n"
-        f"- article: blog posts, news, Wikipedia, documentation, any written content\n"
-        f"- other: anything that doesn't fit above\n\n"
+        f"KEY RULE — look past the URL format to the actual subject:\n"
+        f"  • YouTube/TikTok/Instagram video about a restaurant in Tokyo → category=location, name=restaurant name\n"
+        f"  • YouTube video of a recipe → category=recipe, name=dish name\n"
+        f"  • Blog post reviewing a hotel → category=location, name=hotel name\n"
+        f"  • Amazon link → category=product\n"
+        f"  • News/blog/wiki → category=article\n"
+        f"  • Only use category=video if the video itself is the thing to save (e.g. a tutorial, documentary)\n\n"
+        f"Categories: location, product, article, video, recipe, other\n\n"
+        f"Also extract search_terms: 2-3 short keywords to find RELATED pages in the user's Notion.\n"
+        f"  • For a Tokyo restaurant: [\"Tokyo\", \"Japan\", \"restaurants\"]\n"
+        f"  • For a Paris hotel: [\"Paris\", \"bucket list\"]\n"
+        f"  • For a recipe: [\"recipes\", dish name]\n\n"
         f"Return ONLY valid JSON, no markdown:\n"
-        f'{{ "category": "...", "name": "clean page title or place name", "summary": "2-3 sentence summary of what this is and why it might be useful" }}'
+        f'{{"category":"...","name":"subject name (restaurant/place/product/dish name)","summary":"2-3 sentences about what this is and why useful","search_terms":["term1","term2"]}}'
     )
-    raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=300)
-    # Strip markdown code fences if present
+    raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=400)
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
     raw = re.sub(r"```$", "", raw.strip())
-    # Extract the first {...} block in case there's extra text
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if m:
         raw = m.group(0)
@@ -221,8 +224,55 @@ async def notion_search(query: str) -> list:
             if val.get("type") == "url":
                 url = val.get("url") or ""
                 break
-        results.append({"title": title, "url": url, "notion_url": obj.get("url", "")})
+        results.append({"id": obj.get("id",""), "title": title, "url": url, "notion_url": obj.get("url", "")})
     return results
+
+async def notion_find_related(search_terms: list) -> list:
+    """Search the whole Notion workspace for pages related to the content."""
+    seen = set()
+    related = []
+    for term in search_terms[:3]:
+        try:
+            pages = await notion_search(term)
+            for p in pages[:4]:
+                if p["id"] and p["id"] not in seen and p["title"] != "Untitled":
+                    seen.add(p["id"])
+                    related.append(p)
+        except Exception:
+            pass
+    return related[:4]
+
+async def notion_append_to_page(page_id: str, name: str, link_url: str, summary: str) -> str:
+    """Append a linked entry to an existing Notion page."""
+    rich = [{"type": "text", "text": {"content": name,
+             "link": {"url": link_url} if link_url else None}}]
+    if summary:
+        rich.append({"type": "text", "text": {"content": f" — {summary}"}})
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.patch(
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            headers=NOTION_HEADERS,
+            json={"children": [{"object":"block","type":"bulleted_list_item",
+                                "bulleted_list_item":{"rich_text": rich}}]},
+        )
+    r.raise_for_status()
+    return f"https://www.notion.so/{page_id.replace('-','')}"
+
+async def notion_create_standalone_page(title: str, content: str) -> str:
+    """Create a new standalone Notion page under the workspace root."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            "https://api.notion.com/v1/pages",
+            headers=NOTION_HEADERS,
+            json={
+                "parent": {"type": "workspace", "workspace": True},
+                "properties": {"title": {"title": [{"text": {"content": title}}]}},
+                "children": [{"object":"block","type":"paragraph",
+                               "paragraph":{"rich_text":[{"type":"text","text":{"content":content}}]}}],
+            },
+        )
+    r.raise_for_status()
+    return r.json()["url"]
 
 async def notion_list_recent(category: str | None = None, limit: int = 10) -> list:
     db_ids = [NOTION_DB[category]] if category and category in NOTION_DB else list(NOTION_DB.values())
@@ -368,33 +418,58 @@ async def handle_save_link(chat_id: int, url: str, note: str):
     if clean_note:
         summary = clean_note + (" — " + summary if summary else "")
 
+    # Search the whole Notion workspace for related pages
+    search_terms = result.get("search_terms", [name.split()[0]] if name else [])
+    related_pages = await notion_find_related(search_terms) if search_terms else []
+
     # Store pending action
     pid = str(uuid.uuid4())[:8]
     PENDING[pid] = {
-        "action":      "save_link",
-        "chat_id":     chat_id,
-        "url":         url,
-        "name":        name,
-        "category":    category,
-        "notes":       summary,
-        "forced":      forced_category,
-        "ai_category": ai_category,
+        "action":        "save_link",
+        "chat_id":       chat_id,
+        "url":           url,
+        "name":          name,
+        "category":      category,
+        "notes":         summary,
+        "forced":        forced_category,
+        "ai_category":   ai_category,
+        "related_pages": related_pages,
     }
 
     emoji = CATEGORY_EMOJI.get(category, "📌")
     text = (
         f"🔍 *Analysis*\n\n"
         f"*{name}*\n"
-        f"{emoji} Category: *{category.title()}*\n\n"
-        f"{summary}\n\n"
-        f"Save to Notion?"
+        f"{emoji} Suggested: *{category.title()}*\n\n"
+        f"{summary}"
     )
-    keyboard = [[
-        {"text": "✅ Save",            "callback_data": f"save:{pid}"},
+
+    # Build smart button rows
+    keyboard = []
+
+    # Row 1: add to related pages (up to 2)
+    if related_pages:
+        text += "\n\n*Found in your Notion:*"
+        for p in related_pages[:2]:
+            text += f"\n• {p['title']}"
+        row = [{"text": f"➕ Add to \"{p['title'][:20]}\"",
+                "callback_data": f"addto:{pid}:{p['id']}"}
+               for p in related_pages[:2]]
+        keyboard.append(row)
+
+    # Row 2: save to DB or create new page
+    keyboard.append([
+        {"text": f"💾 Save as {category.title()}",  "callback_data": f"save:{pid}"},
+        {"text": "📄 New Notion page",              "callback_data": f"newpage:{pid}"},
+    ])
+
+    # Row 3: change / cancel
+    keyboard.append([
         {"text": "🔄 Change category", "callback_data": f"change:{pid}"},
         {"text": "❌ Cancel",          "callback_data": f"cancel:{pid}"},
-    ]]
-    text += "\n\n_Or just describe what you want — e.g. \"save as recipe\" or \"add note: try next summer\"_"
+    ])
+
+    text += "\n\n_Or just describe what you want._"
     await tg_send_buttons(chat_id, text, keyboard)
 
 
@@ -503,6 +578,52 @@ async def handle_callback_query(cq: dict):
             {"text": "❌ Cancel", "callback_data": f"cancel:{pid}"},
         ]]
         await tg_edit_buttons(chat_id, message_id, text, keyboard)
+
+    # ── Add to existing Notion page ───────────────────────────────────────────
+    elif data.startswith("addto:"):
+        _, pid, page_id = data.split(":", 2)
+        pending = PENDING.pop(pid, None)
+        if not pending:
+            await tg_edit_buttons(chat_id, message_id, "⏱ Action expired.")
+            return
+        # Find the page title from stored related_pages
+        page_title = next(
+            (p["title"] for p in pending.get("related_pages", []) if p["id"] == page_id),
+            "page"
+        )
+        await tg_edit_buttons(chat_id, message_id,
+                              cq["message"]["text"] + f"\n\n_Adding to \"{page_title}\"…_")
+        try:
+            notion_url = await notion_append_to_page(
+                page_id, pending["name"], pending["url"], pending["notes"])
+            await save_log(pending["url"], pending["notes"], pending["forced"],
+                           pending["ai_category"], pending["category"], pending["name"], "✓ success")
+            await tg_edit_buttons(chat_id, message_id,
+                f"✅ *Added to \"{page_title}\"*\n\n"
+                f"*{pending['name']}*\n\n"
+                f"[Open in Notion]({notion_url})")
+        except Exception as e:
+            await tg_send(chat_id, f"❌ Failed: {e}")
+
+    # ── Create new standalone Notion page ─────────────────────────────────────
+    elif data.startswith("newpage:"):
+        pid = data[8:]
+        pending = PENDING.pop(pid, None)
+        if not pending:
+            await tg_edit_buttons(chat_id, message_id, "⏱ Action expired.")
+            return
+        title   = pending["name"]
+        content = pending["notes"]
+        if pending["url"]:
+            content = (content + "\n\n" if content else "") + pending["url"]
+        try:
+            notion_url = await notion_create_standalone_page(title, content)
+            await save_log(pending["url"], pending["notes"], pending["forced"],
+                           pending["ai_category"], "other", title, "✓ success (new page)")
+            await tg_edit_buttons(chat_id, message_id,
+                f"📄 *New page created*\n\n*{title}*\n\n[Open in Notion]({notion_url})")
+        except Exception as e:
+            await tg_send(chat_id, f"❌ Failed to create page: {e}")
 
     # ── Note confirmed ────────────────────────────────────────────────────────
     elif data.startswith("note:"):
