@@ -1487,11 +1487,22 @@ async def handle_chat(chat_id: int, text: str):
     except Exception:
         pass
 
-    # Search Notion with extracted keywords
+    # Search Notion with extracted keywords.
+    # If the current question yields no results (e.g. "ferry price" doesn't match page text),
+    # retry with the broader topic from conversation history — the user's question may use
+    # different words than what's written in Notion.
     context_lines = []
     notion_results = []
     try:
         notion_results = await notion_search(search_query)
+        if not notion_results and conversation_context:
+            topic_kw = await groq_chat([{"role": "user", "content":
+                f"What is the main topic of this conversation? "
+                f"Return 1-3 keywords that best describe the SUBJECT (not the question itself). "
+                f"Return ONLY the keywords, nothing else.\n\n{conversation_context}"}],
+                max_tokens=20)
+            if topic_kw and topic_kw.strip():
+                notion_results = await notion_search(topic_kw.strip())
         if notion_results:
             context_lines.append("Relevant Notion pages found:")
             for r in notion_results[:6]:
