@@ -158,12 +158,12 @@ async def tg_answer_callback(callback_id: str):
             json={"callback_query_id": callback_id},
         )
 
-async def groq_chat(messages: list, max_tokens: int = 512) -> str:
+async def groq_chat(messages: list, max_tokens: int = 512, model: str = "llama-3.1-8b-instant") -> str:
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={"model": "llama-3.1-8b-instant", "max_tokens": max_tokens, "messages": messages},
+            json={"model": model, "max_tokens": max_tokens, "messages": messages},
         )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip()
@@ -679,20 +679,20 @@ async def notion_read_page_content(page_id: str, max_chars: int = 3000, _depth: 
                 if child_title:
                     lines.append(f"## {child_title}")
                 if _depth < 1:
-                    sub = await notion_read_page_content(block["id"], max_chars=800, _depth=_depth + 1)
+                    sub = await notion_read_page_content(block["id"], max_chars=4000, _depth=_depth + 1)
                     if sub:
                         lines.append(sub)
             elif btype == "toggle":
                 # Toggle block: show the label then recurse into hidden children
                 if text: lines.append(f"▸ {text}")
                 if _depth < 1 and block.get("has_children"):
-                    sub = await notion_read_page_content(block["id"], max_chars=600, _depth=_depth + 1)
+                    sub = await notion_read_page_content(block["id"], max_chars=4000, _depth=_depth + 1)
                     if sub:
                         lines.append(sub)
             elif btype == "column_list":
                 # Recurse into columns
                 if _depth < 1 and block.get("has_children"):
-                    sub = await notion_read_page_content(block["id"], max_chars=400, _depth=_depth + 1)
+                    sub = await notion_read_page_content(block["id"], max_chars=4000, _depth=_depth + 1)
                     if sub:
                         lines.append(sub)
             else:
@@ -1521,7 +1521,7 @@ async def handle_chat(chat_id: int, text: str):
                         context_lines.append(line)
                     pages_read += 1
             else:
-                content = await notion_read_page_content(page["id"], max_chars=2000)
+                content = await notion_read_page_content(page["id"], max_chars=8000)
                 if content and len(content) > 30:
                     context_lines.append(f"\nContent of '{page['title']}':\n{content}")
                     pages_read += 1
@@ -1545,7 +1545,7 @@ async def handle_chat(chat_id: int, text: str):
                     parent_meta = await notion_fetch_page_meta(parent_id)
                     parent_title = parent_meta.get("title", "")
                     if parent_title:
-                        parent_content = await notion_read_page_content(parent_id, max_chars=3000)
+                        parent_content = await notion_read_page_content(parent_id, max_chars=8000)
                         if parent_content and len(parent_content) > 30:
                             context_lines.append(
                                 f"\nParent page '{parent_title}' (contains '{page['title']}'):\n{parent_content}"
@@ -1559,7 +1559,7 @@ async def handle_chat(chat_id: int, text: str):
                                 if sid in seen_children or sib_added >= 5:
                                     continue
                                 seen_children.add(sid)
-                                sib_content = await notion_read_page_content(sid, max_chars=1200)
+                                sib_content = await notion_read_page_content(sid, max_chars=4000)
                                 if sib_content and len(sib_content) > 20:
                                     context_lines.append(
                                         f"\nSibling page '{sib['title']}' (inside '{parent_title}'):\n{sib_content}"
@@ -1582,7 +1582,7 @@ async def handle_chat(chat_id: int, text: str):
                 if cid in seen_children or added >= 5:
                     continue
                 seen_children.add(cid)
-                child_content = await notion_read_page_content(cid, max_chars=1200)
+                child_content = await notion_read_page_content(cid, max_chars=4000)
                 if child_content and len(child_content) > 20:
                     context_lines.append(
                         f"\nChild page '{child['title']}' (inside '{page['title']}'):\n{child_content}"
@@ -1622,7 +1622,7 @@ async def handle_chat(chat_id: int, text: str):
     messages.append({"role": "user", "content": text})
 
     try:
-        response = await groq_chat(messages, max_tokens=600)
+        response = await groq_chat(messages, max_tokens=1024, model="llama-3.3-70b-versatile")
         await tg_send(chat_id, response)
         # Store assistant reply in history
         history.append({"role": "assistant", "content": response})
