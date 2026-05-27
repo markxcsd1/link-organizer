@@ -409,10 +409,21 @@ async def handle_create_note(chat_id: int, content: str):
 
 
 async def handle_chat(chat_id: int, text: str):
-    # Always search Notion first so the AI has real data to answer from
+    # Extract search keywords from natural language before querying Notion
+    search_query = text
+    try:
+        kw = await groq_chat([{"role": "user", "content":
+            f"Extract 1-3 search keywords from this message. Return ONLY the keywords, nothing else.\n\nMessage: {text}"}],
+            max_tokens=30)
+        if kw:
+            search_query = kw.strip()
+    except Exception:
+        pass
+
+    # Search Notion with the extracted keywords
     context_lines = []
     try:
-        notion_results = await notion_search(text)
+        notion_results = await notion_search(search_query)
         if notion_results:
             context_lines.append("Relevant items from the user's Notion knowledge base:")
             for r in notion_results[:6]:
