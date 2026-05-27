@@ -498,21 +498,30 @@ async def notion_search(query: str) -> list:
     return results
 
 async def notion_fetch_page_meta(page_id: str) -> dict:
-    """Fetch a single page's title and parent info."""
+    """Fetch a single page's (or database's) title and parent info."""
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(f"https://api.notion.com/v1/pages/{page_id}", headers=NOTION_HEADERS)
+            if r.status_code == 404:
+                # Could be a database — try the databases endpoint
+                r = await client.get(f"https://api.notion.com/v1/databases/{page_id}", headers=NOTION_HEADERS)
         if r.status_code != 200:
             return {}
         data = r.json()
-        props = data.get("properties", {})
+        obj_type = data.get("object", "page")
         title = ""
-        for val in props.values():
-            if val.get("type") == "title":
-                items = val.get("title", [])
-                if items:
-                    title = items[0].get("plain_text", "")
-                    break
+        if obj_type == "database":
+            title_arr = data.get("title", [])
+            if title_arr:
+                title = title_arr[0].get("plain_text", "")
+        else:
+            props = data.get("properties", {})
+            for val in props.values():
+                if val.get("type") == "title":
+                    items = val.get("title", [])
+                    if items:
+                        title = items[0].get("plain_text", "")
+                        break
         return {"id": data["id"], "title": title, "parent": data.get("parent", {}),
                 "url": data.get("url", "")}
     except Exception:
