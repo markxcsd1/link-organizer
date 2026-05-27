@@ -462,6 +462,27 @@ async def notion_search(query: str) -> list:
         results.append({"id": obj.get("id",""), "title": title, "url": url, "notion_url": obj.get("url", "")})
     return results
 
+async def notion_fetch_page_meta(page_id: str) -> dict:
+    """Fetch a single page's title and parent info."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"https://api.notion.com/v1/pages/{page_id}", headers=NOTION_HEADERS)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        props = data.get("properties", {})
+        title = ""
+        for val in props.values():
+            if val.get("type") == "title":
+                items = val.get("title", [])
+                if items:
+                    title = items[0].get("plain_text", "")
+                    break
+        return {"id": data["id"], "title": title, "parent": data.get("parent", {}),
+                "url": data.get("url", "")}
+    except Exception:
+        return {}
+
 async def notion_find_related(search_terms: list) -> list:
     seen = set()
     related = []
@@ -1130,6 +1151,29 @@ async def handle_chat(chat_id: int, text: str):
                     pages_read += 1
             except Exception:
                 pass
+
+    # Also traverse parent pages — e.g. "Sifnos" page may live inside "Summer 2026"
+    seen_parents: set = set()
+    for page in notion_results[:3]:
+        if not page.get("id"):
+            continue
+        try:
+            page_meta = await notion_fetch_page_meta(page["id"])
+            parent = page_meta.get("parent", {})
+            if parent.get("type") == "page_id":
+                parent_id = parent["page_id"]
+                if parent_id not in seen_parents:
+                    seen_parents.add(parent_id)
+                    parent_meta = await notion_fetch_page_meta(parent_id)
+                    parent_title = parent_meta.get("title", "")
+                    if parent_title:
+                        parent_content = await notion_read_page_content(parent_id, max_chars=800)
+                        if parent_content and len(parent_content) > 30:
+                            context_lines.append(
+                                f"\nParent page '{parent_title}' (contains '{page['title']}'):\n{parent_content}"
+                            )
+        except Exception:
+            pass
 
     # Also pull recent saves for general context
     try:
