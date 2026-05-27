@@ -1,4 +1,5 @@
 import os, json, re, secrets, uuid, httpx
+from urllib.parse import unquote_plus
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 
@@ -67,6 +68,24 @@ Just talk to me in natural language — I'll search your knowledge base and answ
 def _rich_text(value: str) -> list:
     return [{"text": {"content": value[:2000]}}]
 
+def _extract_json(text: str) -> str:
+    """Extract the first complete JSON object by counting balanced braces."""
+    start = text.find('{')
+    if start == -1:
+        return text
+    depth, in_str, esc = 0, False, False
+    for i, c in enumerate(text[start:], start):
+        if esc:           esc = False; continue
+        if c == '\\' and in_str: esc = True; continue
+        if c == '"':      in_str = not in_str; continue
+        if in_str:        continue
+        if c == '{':      depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return text[start:]
+
 def parse_command(note: str) -> tuple:
     note = note.strip()
     if note.startswith("!"):
@@ -88,7 +107,6 @@ async def tg_send(chat_id: int, text: str):
         )
 
 async def tg_send_buttons(chat_id: int, text: str, keyboard: list):
-    """Send a message with inline keyboard buttons."""
     if not TELEGRAM_TOKEN:
         return
     async with httpx.AsyncClient(timeout=10) as client:
@@ -104,7 +122,6 @@ async def tg_send_buttons(chat_id: int, text: str, keyboard: list):
         )
 
 async def tg_edit_buttons(chat_id: int, message_id: int, text: str, keyboard: list | None = None):
-    """Edit an existing message (to replace buttons after tap)."""
     if not TELEGRAM_TOKEN:
         return
     payload: dict = {"chat_id": chat_id, "message_id": message_id,
@@ -134,68 +151,95 @@ async def groq_chat(messages: list, max_tokens: int = 512) -> str:
     return r.json()["choices"][0]["message"]["content"].strip()
 
 async def fetch_page_meta(url: str) -> dict:
-    """Fetch real page title + description. Uses oEmbed for YouTube/Vimeo."""
-    # YouTube and YouTube Shorts — oEmbed for title + scrape page for description
-    if re.search(r'(youtube\.com|youtu\.be)', url, re.IGNORECASE):
-        title, desc, author = "", "", ""
-        try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                r = await client.get(f"https://www.youtube.com/oembed?url={url}&format=json")
-            if r.status_code == 200:
-                data = r.json()
-                title  = data.get("title", "")[:200]
-                author = data.get("author_name", "")
-        except Exception:
-            pass
-        try:
-            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-                rp = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-            # Description is in meta tag and/or shortDescription in ytInitialData
-            m = re.search(r'"shortDescription":"((?:[^"\\]|\\.){0,2000})"', rp.text)
-            if m:
-                desc = m.group(1).replace("\\n", "\n").replace('\\"', '"')[:800]
-            if not desc:
-                m2 = re.search(r'<meta name="description" content="([^"]+)"', rp.text)
-                if m2:
-                    desc = m2.group(1)[:400]
-        except Exception:
-            pass
-        if title:
-            return {"title": title, "desc": (desc or f"YouTube video by {author}"), "author": author}
+    """
+    Generic metadata fetch — one request, follow all redirects, then:
+    1. oEmbed auto-discovery (YouTube, Vimeo, Twitter, SoundCloud, etc.)
+    2. Open Graph tags
+    3. Standard <title> / meta description
+    4. Google Maps: extract place name from final URL
+    """
+    title, desc, author, final_url, html = "", "", "", url, ""
 
-
-    # Vimeo oEmbed
-    if "vimeo.com" in url:
-        try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                r = await client.get(
-                    f"https://vimeo.com/api/oembed.json?url={url}")
-            if r.status_code == 200:
-                data = r.json()
-                return {
-                    "title": data.get("title", "")[:200],
-                    "desc":  data.get("description", "")[:400],
-                }
-        except Exception:
-            pass
-
-    # Generic: scrape HTML meta tags
     try:
-        async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
-            r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+        async with httpx.AsyncClient(
+            timeout=12, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        ) as client:
+            r = await client.get(url)
+        final_url = str(r.url)
         html = r.text
-        og_title    = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-        plain_title = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
-        og_desc     = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-        meta_desc   = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-        title = (og_title or plain_title)
-        desc  = (og_desc or meta_desc)
-        return {
-            "title": title.group(1).strip()[:200] if title else "",
-            "desc":  desc.group(1).strip()[:400]  if desc  else "",
-        }
     except Exception:
-        return {"title": "", "desc": ""}
+        return {"title": "", "desc": "", "author": "", "final_url": url, "maps_url": ""}
+
+    # 1. oEmbed auto-discovery — works for any platform that embeds a <link> tag
+    oe_url = ""
+    m = re.search(r'<link[^>]+type=["\']application/json\+oembed["\'][^>]+href=["\']([^"\']+)["\']', html, re.IGNORECASE)
+    if not m:
+        m = re.search(r'<link[^>]+href=["\']([^"\']+)["\'][^>]+type=["\']application/json\+oembed["\']', html, re.IGNORECASE)
+    if m:
+        oe_url = m.group(1)
+    if oe_url:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                oe = await client.get(oe_url)
+            if oe.status_code == 200:
+                od = oe.json()
+                title  = od.get("title", "")[:200]
+                author = od.get("author_name", "")
+                desc   = od.get("description", "")[:600] or (f"By {author}" if author else "")
+        except Exception:
+            pass
+
+    # For YouTube: also grab video description from page source (richer than oEmbed)
+    if "youtube" in final_url and not desc:
+        m = re.search(r'"shortDescription":"((?:[^"\\]|\\.){0,1500})"', html)
+        if m:
+            desc = m.group(1).replace("\\n", "\n").replace('\\"', '"')[:800]
+
+    # 2. Open Graph tags (fallback or supplement)
+    def _og(prop: str) -> str:
+        pat1 = rf'<meta[^>]+property=["\']og:{prop}["\'][^>]+content=["\']([^"\']+)["\']'
+        pat2 = rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:{prop}["\']'
+        mm = re.search(pat1, html, re.IGNORECASE) or re.search(pat2, html, re.IGNORECASE)
+        return mm.group(1).strip() if mm else ""
+
+    if not title: title = _og("title")
+    if not desc:  desc  = _og("description")
+
+    # 3. Standard <title> and meta description
+    if not title:
+        m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
+        if m: title = m.group(1).strip()[:200]
+    if not desc:
+        for pat in [
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
+        ]:
+            m = re.search(pat, html, re.IGNORECASE)
+            if m: desc = m.group(1).strip()[:400]; break
+
+    # 4. Google Maps — extract place name from final URL
+    maps_url = ""
+    if re.search(r'(maps\.google\.|google\.[a-z.]+/maps|maps\.app\.goo\.gl)', url + " " + final_url, re.IGNORECASE):
+        maps_url = final_url
+        place = ""
+        pm = re.search(r'/maps/place/([^/@?&#]+)', final_url)
+        if pm:
+            place = unquote_plus(pm.group(1))
+        else:
+            qm = re.search(r'[?&]q=([^&#]+)', final_url)
+            if qm:
+                place = unquote_plus(qm.group(1)).split(',')[0].strip()
+        if place and (not title or title.lower() in ("google maps", "maps")):
+            title = place[:200]
+
+    return {
+        "title": title[:200] if title else "",
+        "desc":  desc[:600]  if desc  else "",
+        "author": author,
+        "final_url": final_url,
+        "maps_url": maps_url,
+    }
 
 
 # ── Notion operations ─────────────────────────────────────────────────────────
@@ -209,7 +253,6 @@ async def web_lookup(query: str) -> str:
         if r.status_code == 200:
             d = r.json()
             text = d.get("AbstractText") or d.get("Answer") or ""
-            # Also grab top infobox entries (rating, address, hours, etc.)
             extras = []
             for entry in d.get("Infobox", {}).get("content", []):
                 label = entry.get("label", "")
@@ -234,7 +277,6 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
         r'(restaurant|bar|cafe|hotel|beach|tavern|bistro|shop|museum|place|spot)',
         title + " " + desc, re.IGNORECASE)
     if place_hint or (note and re.search(r'(restaurant|bar|cafe|hotel|place)', note, re.IGNORECASE)):
-        # Extract candidate name from title — look for text after 📍 or last proper noun
         name_after_pin = re.search(r'📍\s*(\S[^,\n]{1,50})', title)
         candidate = name_after_pin.group(1).strip() if name_after_pin else title[:60]
         web_info = await web_lookup(candidate)
@@ -268,10 +310,7 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
     raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=700)
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
     raw = re.sub(r"```$", "", raw.strip())
-    m = re.search(r"\{.*\}", raw, re.DOTALL)
-    if m:
-        raw = m.group(0)
-    return json.loads(raw)
+    return json.loads(_extract_json(raw))
 
 async def notion_save_page(db_id: str, properties: dict) -> str:
     async with httpx.AsyncClient(timeout=15) as client:
@@ -310,7 +349,6 @@ async def notion_search(query: str) -> list:
     return results
 
 async def notion_find_related(search_terms: list) -> list:
-    """Search the whole Notion workspace for pages related to the content."""
     seen = set()
     related = []
     for term in search_terms[:3]:
@@ -325,7 +363,6 @@ async def notion_find_related(search_terms: list) -> list:
     return related[:4]
 
 async def notion_append_to_page(page_id: str, name: str, link_url: str, summary: str) -> str:
-    """Append a linked entry to an existing Notion page."""
     rich = [{"type": "text", "text": {"content": name,
              "link": {"url": link_url} if link_url else None}}]
     if summary:
@@ -341,7 +378,6 @@ async def notion_append_to_page(page_id: str, name: str, link_url: str, summary:
     return f"https://www.notion.so/{page_id.replace('-','')}"
 
 async def notion_create_standalone_page(title: str, content: str) -> str:
-    """Create a new standalone Notion page under the workspace root."""
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
             "https://api.notion.com/v1/pages",
@@ -480,10 +516,8 @@ async def handle_save_link(chat_id: int, url: str, note: str):
     forced_category, clean_note = parse_command(note)
     await tg_send(chat_id, "🔍 Analysing…")
 
-    # Fetch real page metadata
     meta = await fetch_page_meta(url)
 
-    # Ask Groq to classify + summarise
     try:
         result = await notion_analyse_link(url, clean_note, meta)
     except Exception as e:
@@ -501,16 +535,14 @@ async def handle_save_link(chat_id: int, url: str, note: str):
     vibe      = result.get("vibe", "")
     best_for  = result.get("best_for", "")
     rating    = result.get("rating", "")
-    maps_link = result.get("maps_link", "")
+    maps_link = meta.get("maps_url") or result.get("maps_link", "")
     summary   = result.get("summary", "")[:600]
     if clean_note:
         summary = clean_note + (" — " + summary if summary else "")
 
-    # Search the whole Notion workspace for related pages
     search_terms = result.get("search_terms", [name.split()[0]] if name else [])
     related_pages = await notion_find_related(search_terms) if search_terms else []
 
-    # Store pending action
     pid = str(uuid.uuid4())[:8]
     PENDING[pid] = {
         "action":        "save_link",
@@ -526,8 +558,6 @@ async def handle_save_link(chat_id: int, url: str, note: str):
     }
 
     emoji = CATEGORY_EMOJI.get(category, "📌")
-
-    # Build rich analysis card
     lines = [f"🔍 *{name}*"]
     if location:
         lines.append(f"📍 {location}")
@@ -548,10 +578,7 @@ async def handle_save_link(chat_id: int, url: str, note: str):
 
     text = "\n".join(lines)
 
-    # Build smart button rows
     keyboard = []
-
-    # Row 1: add to related pages (up to 2)
     if related_pages:
         text += "\n\n*Found in your Notion:*"
         for p in related_pages[:2]:
@@ -561,13 +588,10 @@ async def handle_save_link(chat_id: int, url: str, note: str):
                for p in related_pages[:2]]
         keyboard.append(row)
 
-    # Row 2: save to DB or create new page
     keyboard.append([
         {"text": f"💾 Save as {category.title()}",  "callback_data": f"save:{pid}"},
         {"text": "📄 New Notion page",              "callback_data": f"newpage:{pid}"},
     ])
-
-    # Row 3: change / cancel
     keyboard.append([
         {"text": "🔄 Change category", "callback_data": f"change:{pid}"},
         {"text": "❌ Cancel",          "callback_data": f"cancel:{pid}"},
@@ -578,7 +602,6 @@ async def handle_save_link(chat_id: int, url: str, note: str):
 
 
 async def _do_save_link(chat_id: int, pending: dict, message_id: int | None = None):
-    """Actually save the link to Notion after confirmation."""
     url      = pending["url"]
     category = pending["category"]
     name     = pending["name"]
@@ -611,7 +634,6 @@ async def _do_save_link(chat_id: int, pending: dict, message_id: int | None = No
 
 
 async def handle_callback_query(cq: dict):
-    """Handle button taps."""
     cq_id      = cq["id"]
     data       = cq.get("data", "")
     chat_id    = cq["message"]["chat"]["id"]
@@ -623,26 +645,20 @@ async def handle_callback_query(cq: dict):
     if user_id != TELEGRAM_USER_ID:
         return
 
-    # ── Save confirmed ────────────────────────────────────────────────────────
     if data.startswith("save:"):
         pid = data[5:]
         pending = PENDING.pop(pid, None)
         if not pending:
-            await tg_edit_buttons(chat_id, message_id,
-                                  "⏱ Action expired — send the link again.")
+            await tg_edit_buttons(chat_id, message_id, "⏱ Action expired — send the link again.")
             return
-        await tg_edit_buttons(chat_id, message_id,
-                              cq["message"]["text"] + "\n\n_Saving…_")
+        await tg_edit_buttons(chat_id, message_id, cq["message"]["text"] + "\n\n_Saving…_")
         await _do_save_link(chat_id, pending, message_id)
 
-    # ── Cancelled ─────────────────────────────────────────────────────────────
     elif data.startswith("cancel:"):
         pid = data[7:]
         PENDING.pop(pid, None)
-        await tg_edit_buttons(chat_id, message_id,
-                              cq["message"]["text"] + "\n\n_Cancelled._")
+        await tg_edit_buttons(chat_id, message_id, cq["message"]["text"] + "\n\n_Cancelled._")
 
-    # ── Change category — show category picker ────────────────────────────────
     elif data.startswith("change:"):
         pid = data[7:]
         if pid not in PENDING:
@@ -651,17 +667,14 @@ async def handle_callback_query(cq: dict):
         keyboard = []
         row = []
         for cat, emoji in CATEGORY_EMOJI.items():
-            row.append({"text": f"{emoji} {cat.title()}",
-                        "callback_data": f"setcat:{pid}:{cat}"})
+            row.append({"text": f"{emoji} {cat.title()}", "callback_data": f"setcat:{pid}:{cat}"})
             if len(row) == 3:
                 keyboard.append(row)
                 row = []
         if row:
             keyboard.append(row)
-        await tg_edit_buttons(chat_id, message_id,
-                              "Choose a category:", keyboard)
+        await tg_edit_buttons(chat_id, message_id, "Choose a category:", keyboard)
 
-    # ── Category selected ─────────────────────────────────────────────────────
     elif data.startswith("setcat:"):
         _, pid, new_cat = data.split(":", 2)
         pending = PENDING.get(pid)
@@ -683,18 +696,14 @@ async def handle_callback_query(cq: dict):
         ]]
         await tg_edit_buttons(chat_id, message_id, text, keyboard)
 
-    # ── Add to existing Notion page ───────────────────────────────────────────
     elif data.startswith("addto:"):
         _, pid, page_id = data.split(":", 2)
         pending = PENDING.pop(pid, None)
         if not pending:
             await tg_edit_buttons(chat_id, message_id, "⏱ Action expired.")
             return
-        # Find the page title from stored related_pages
         page_title = next(
-            (p["title"] for p in pending.get("related_pages", []) if p["id"] == page_id),
-            "page"
-        )
+            (p["title"] for p in pending.get("related_pages", []) if p["id"] == page_id), "page")
         await tg_edit_buttons(chat_id, message_id,
                               cq["message"]["text"] + f"\n\n_Adding to \"{page_title}\"…_")
         try:
@@ -703,13 +712,10 @@ async def handle_callback_query(cq: dict):
             await save_log(pending["url"], pending["notes"], pending["forced"],
                            pending["ai_category"], pending["category"], pending["name"], "✓ success")
             await tg_edit_buttons(chat_id, message_id,
-                f"✅ *Added to \"{page_title}\"*\n\n"
-                f"*{pending['name']}*\n\n"
-                f"[Open in Notion]({notion_url})")
+                f"✅ *Added to \"{page_title}\"*\n\n*{pending['name']}*\n\n[Open in Notion]({notion_url})")
         except Exception as e:
             await tg_send(chat_id, f"❌ Failed: {e}")
 
-    # ── Create new standalone Notion page ─────────────────────────────────────
     elif data.startswith("newpage:"):
         pid = data[8:]
         pending = PENDING.pop(pid, None)
@@ -729,7 +735,6 @@ async def handle_callback_query(cq: dict):
         except Exception as e:
             await tg_send(chat_id, f"❌ Failed to create page: {e}")
 
-    # ── Note confirmed ────────────────────────────────────────────────────────
     elif data.startswith("note:"):
         pid = data[5:]
         pending = PENDING.pop(pid, None)
@@ -759,7 +764,6 @@ async def handle_callback_query(cq: dict):
 
 
 async def handle_pending_modification(chat_id: int, text: str, pid: str, pending: dict):
-    """Interpret free-text input as a modification to a pending save."""
     current = json.dumps({
         "name": pending.get("name", ""),
         "category": pending.get("category", ""),
@@ -780,8 +784,7 @@ async def handle_pending_modification(chat_id: int, text: str, pid: str, pending
         raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=200)
         raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
         raw = re.sub(r"```$", "", raw.strip())
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        result = json.loads(m.group(0) if m else raw)
+        result = json.loads(_extract_json(raw))
     except Exception:
         await tg_send(chat_id, "Didn't understand that — use the buttons or say *save*, *cancel*, or describe a change.")
         return
@@ -793,12 +796,11 @@ async def handle_pending_modification(chat_id: int, text: str, pid: str, pending
         await tg_send(chat_id, "❌ Cancelled.")
         return
 
-    if action in ("save",):
+    if action == "save":
         PENDING.pop(pid, None)
         await _do_save_link(chat_id, pending)
         return
 
-    # modify — update whichever fields changed
     new_cat = result.get("category", "").lower()
     if new_cat and new_cat in NOTION_DB:
         pending["category"] = new_cat
@@ -879,7 +881,6 @@ async def handle_list(chat_id: int, category: str | None = None):
 
 
 async def handle_create_note(chat_id: int, content: str):
-    """Show note preview and ask for confirmation."""
     if ":" in content:
         title, body = content.split(":", 1)
         title, body = title.strip(), body.strip()
@@ -904,7 +905,6 @@ async def handle_create_note(chat_id: int, content: str):
 
 
 async def handle_chat(chat_id: int, text: str):
-    # Extract search keywords from natural language
     search_query = text
     try:
         kw = await groq_chat([{"role": "user", "content":
@@ -962,7 +962,6 @@ async def handle_chat(chat_id: int, text: str):
 async def telegram_webhook(req: Request):
     data = await req.json()
 
-    # Handle button taps
     if "callback_query" in data:
         await handle_callback_query(data["callback_query"])
         return {"ok": True}
@@ -999,7 +998,6 @@ async def telegram_webhook(req: Request):
         await handle_save_link(chat_id, url, note)
 
     else:
-        # If there's a pending action waiting, treat this as a modification request
         pending_entry = next(
             ((pid, p) for pid, p in PENDING.items() if p.get("chat_id") == chat_id),
             None,
