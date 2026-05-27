@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os, json, re, secrets, uuid, httpx
 from urllib.parse import unquote_plus
 from fastapi import FastAPI, HTTPException, Header, Request
@@ -573,9 +574,10 @@ def _map_type(raw: str) -> str:
     if raw in _VALID_TYPES:
         return raw
     lower = raw.lower()
-    for k, v in _TYPE_MAP.items():
+    # Sort longest keys first so "village" is checked before "villa", etc.
+    for k in sorted(_TYPE_MAP, key=len, reverse=True):
         if k in lower:
-            return v
+            return _TYPE_MAP[k]
     return "Other"
 
 async def insert_into_trip_db(db_id: str, pending: dict) -> str:
@@ -1541,7 +1543,7 @@ async def handle_chat(chat_id: int, text: str):
                     parent_meta = await notion_fetch_page_meta(parent_id)
                     parent_title = parent_meta.get("title", "")
                     if parent_title:
-                        parent_content = await notion_read_page_content(parent_id, max_chars=800)
+                        parent_content = await notion_read_page_content(parent_id, max_chars=2000)
                         if parent_content and len(parent_content) > 30:
                             context_lines.append(
                                 f"\nParent page '{parent_title}' (contains '{page['title']}'):\n{parent_content}"
