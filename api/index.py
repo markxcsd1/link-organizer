@@ -503,7 +503,8 @@ async def notion_fetch_page_meta(page_id: str) -> dict:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(f"https://api.notion.com/v1/pages/{page_id}", headers=NOTION_HEADERS)
-            if r.status_code == 404:
+            # Notion returns 400 (not 404) when you call /v1/pages/{id} with a database id
+            if r.status_code != 200:
                 # Could be a database — try the databases endpoint
                 r = await client.get(f"https://api.notion.com/v1/databases/{page_id}", headers=NOTION_HEADERS)
         if r.status_code != 200:
@@ -1667,7 +1668,9 @@ async def handle_chat(chat_id: int, text: str):
         "NOT visit records, and their dates are bookmark dates, not visit dates. Never use them to answer itinerary questions.\n"
         "- If something isn't in the data, say so clearly. Do NOT invent or guess.\n"
         "- Be concise. Plain text only, no markdown.\n"
-        "- Never show your reasoning or thinking process. Just give the answer directly."
+        "- Output ONLY the final answer. Do not narrate your reasoning, do not "
+        "correct yourself mid-sentence, do not say what something is NOT before "
+        "saying what it IS. Think silently, then write one clean answer."
     )
 
     # Build message list with full conversation history for context
@@ -1787,4 +1790,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "dual-search"}
+    return {"ok": True, "v": "db-meta-400"}

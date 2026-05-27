@@ -18,6 +18,7 @@ from api.index import (
     notion_query_db_rows,
     insert_into_trip_db,
     notion_read_page_content,
+    notion_fetch_page_meta,
     _map_type,
 )
 
@@ -317,3 +318,31 @@ class TestNotionReadTableBlocks:
         assert "Kimolos → Sifnos" in content
         assert "€34.70" in content
         assert "Leg | Route | Price" in content
+
+
+# ── notion_fetch_page_meta: database fallback ─────────────────────────────────
+
+class TestNotionFetchPageMeta:
+    @respx.mock
+    async def test_database_id_falls_back_via_400(self):
+        """When called with a DATABASE id, /v1/pages/{id} returns 400 (NOT 404).
+        Must fall back to /v1/databases/{id}. Regression guard — without this,
+        parent traversal silently fails for every database, hiding the trip page."""
+        db_id = "db-id-123"
+        # /v1/pages/{db_id} returns 400 (this is what Notion does for db IDs)
+        respx.get(f"https://api.notion.com/v1/pages/{db_id}").mock(
+            return_value=httpx.Response(400, json={"message": "validation error"}))
+        # /v1/databases/{db_id} returns 200 with proper db metadata + page parent
+        respx.get(f"https://api.notion.com/v1/databases/{db_id}").mock(
+            return_value=httpx.Response(200, json={
+                "object": "database",
+                "id": db_id,
+                "title": [{"plain_text": "⛵ Sifnos — Jul 17–20"}],
+                "parent": {"type": "page_id", "page_id": "summer-2026"},
+                "url": "https://notion.so/sifnos-db",
+            }))
+
+        meta = await notion_fetch_page_meta(db_id)
+        assert meta["id"] == db_id
+        assert meta["title"] == "⛵ Sifnos — Jul 17–20"
+        assert meta["parent"] == {"type": "page_id", "page_id": "summer-2026"}
