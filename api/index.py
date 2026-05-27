@@ -135,20 +135,34 @@ async def groq_chat(messages: list, max_tokens: int = 512) -> str:
 
 async def fetch_page_meta(url: str) -> dict:
     """Fetch real page title + description. Uses oEmbed for YouTube/Vimeo."""
-    # YouTube and YouTube Shorts — use oEmbed (free, no API key, returns real title)
+    # YouTube and YouTube Shorts — oEmbed for title + scrape page for description
     if re.search(r'(youtube\.com|youtu\.be)', url, re.IGNORECASE):
+        title, desc, author = "", "", ""
         try:
             async with httpx.AsyncClient(timeout=8) as client:
-                r = await client.get(
-                    f"https://www.youtube.com/oembed?url={url}&format=json")
+                r = await client.get(f"https://www.youtube.com/oembed?url={url}&format=json")
             if r.status_code == 200:
                 data = r.json()
-                return {
-                    "title": data.get("title", "")[:200],
-                    "desc":  f"YouTube video by {data.get('author_name', '')}",
-                }
+                title  = data.get("title", "")[:200]
+                author = data.get("author_name", "")
         except Exception:
             pass
+        try:
+            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                rp = await client.get(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+            # Description is in meta tag and/or shortDescription in ytInitialData
+            m = re.search(r'"shortDescription":"((?:[^"\\]|\\.){0,2000})"', rp.text)
+            if m:
+                desc = m.group(1).replace("\\n", "\n").replace('\\"', '"')[:800]
+            if not desc:
+                m2 = re.search(r'<meta name="description" content="([^"]+)"', rp.text)
+                if m2:
+                    desc = m2.group(1)[:400]
+        except Exception:
+            pass
+        if title:
+            return {"title": title, "desc": (desc or f"YouTube video by {author}"), "author": author}
+
 
     # Vimeo oEmbed
     if "vimeo.com" in url:
@@ -186,35 +200,72 @@ async def fetch_page_meta(url: str) -> dict:
 
 # ── Notion operations ─────────────────────────────────────────────────────────
 
+async def web_lookup(query: str) -> str:
+    """DuckDuckGo Instant Answer — free, no API key, good for well-known places."""
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get("https://api.duckduckgo.com/",
+                params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
+        if r.status_code == 200:
+            d = r.json()
+            text = d.get("AbstractText") or d.get("Answer") or ""
+            # Also grab top infobox entries (rating, address, hours, etc.)
+            extras = []
+            for entry in d.get("Infobox", {}).get("content", []):
+                label = entry.get("label", "")
+                value = entry.get("value", "")
+                if label and value and label.lower() in ("rating","address","phone","hours","price range"):
+                    extras.append(f"{label}: {value}")
+            if extras:
+                text = text + "\n" + "\n".join(extras) if text else "\n".join(extras)
+            return text[:600]
+    except Exception:
+        pass
+    return ""
+
 async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
-    """Deep analysis: understand the SUBJECT of the content, not just its format."""
+    """Deep analysis: extract the actual subject, do a web lookup for extra details."""
+    title = meta.get("title", "")
+    desc  = meta.get("desc", "")
+
+    # If it looks like a place/restaurant/bar/hotel, do an extra web lookup
+    web_info = ""
+    place_hint = re.search(
+        r'(restaurant|bar|cafe|hotel|beach|tavern|bistro|shop|museum|place|spot)',
+        title + " " + desc, re.IGNORECASE)
+    if place_hint or (note and re.search(r'(restaurant|bar|cafe|hotel|place)', note, re.IGNORECASE)):
+        # Extract candidate name from title — look for text after 📍 or last proper noun
+        name_after_pin = re.search(r'📍\s*(\S[^,\n]{1,50})', title)
+        candidate = name_after_pin.group(1).strip() if name_after_pin else title[:60]
+        web_info = await web_lookup(candidate)
+
     meta_text = ""
-    if meta.get("title"):
-        meta_text += f"Page title: {meta['title']}\n"
-    if meta.get("desc"):
-        meta_text += f"Page description: {meta['desc']}\n"
+    if title:
+        meta_text += f"Title: {title}\n"
+    if desc:
+        meta_text += f"Description: {desc[:600]}\n"
+    if web_info:
+        meta_text += f"Web info: {web_info}\n"
 
     prompt = (
-        f"Analyse this link for a personal knowledge base. Think about the SUBJECT, not the medium.\n"
+        f"Analyse this link for a personal knowledge base. Focus on the SUBJECT, not the medium.\n"
         f"URL: {url}\n"
         f"{meta_text}"
         f"{'User note: ' + note if note else ''}\n\n"
-        f"KEY RULE — look past the URL format to the actual subject:\n"
-        f"  • YouTube/TikTok/Instagram video about a restaurant in Tokyo → category=location, name=restaurant name\n"
-        f"  • YouTube video of a recipe → category=recipe, name=dish name\n"
-        f"  • Blog post reviewing a hotel → category=location, name=hotel name\n"
-        f"  • Amazon link → category=product\n"
-        f"  • News/blog/wiki → category=article\n"
-        f"  • Only use category=video if the video itself is the thing to save (e.g. a tutorial, documentary)\n\n"
+        f"RULES:\n"
+        f"1. Look past the URL type to the actual subject:\n"
+        f"   • Video/reel about a restaurant → category=location, name=the restaurant name\n"
+        f"   • Video about a recipe → category=recipe, name=the dish\n"
+        f"   • Video reviewing a product → category=product, name=the product\n"
+        f"   • Use category=video ONLY if the video itself is what matters (tutorial, documentary)\n"
+        f"2. Extract the EXACT name. If the title contains '📍Name' or 'bar Name' or 'restaurant Name', use that exact name.\n"
+        f"3. If web info has rating, address, or reviews — include them in the summary.\n"
+        f"4. Generate a maps_link: Google Maps search URL for the place (if it's a location).\n\n"
         f"Categories: location, product, article, video, recipe, other\n\n"
-        f"Also extract search_terms: 2-3 short keywords to find RELATED pages in the user's Notion.\n"
-        f"  • For a Tokyo restaurant: [\"Tokyo\", \"Japan\", \"restaurants\"]\n"
-        f"  • For a Paris hotel: [\"Paris\", \"bucket list\"]\n"
-        f"  • For a recipe: [\"recipes\", dish name]\n\n"
         f"Return ONLY valid JSON, no markdown:\n"
-        f'{{"category":"...","name":"subject name (restaurant/place/product/dish name)","summary":"2-3 sentences about what this is and why useful","search_terms":["term1","term2"]}}'
+        f'{{"category":"...","name":"exact subject name","location":"city/country if known","summary":"3-4 sentences — what it is, vibe/style, any rating or review highlights","maps_link":"https://www.google.com/maps/search/Name+City or empty","search_terms":["term1","term2"]}}'
     )
-    raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=400)
+    raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=500)
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
     raw = re.sub(r"```$", "", raw.strip())
     m = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -444,8 +495,10 @@ async def handle_save_link(chat_id: int, url: str, note: str):
     if category not in NOTION_DB:
         category = "other"
 
-    name    = result.get("name", meta.get("title", ""))[:200] or url
-    summary = result.get("summary", "")[:400]
+    name      = result.get("name", meta.get("title", ""))[:200] or url
+    location  = result.get("location", "")
+    maps_link = result.get("maps_link", "")
+    summary   = result.get("summary", "")[:500]
     if clean_note:
         summary = clean_note + (" — " + summary if summary else "")
 
@@ -465,15 +518,16 @@ async def handle_save_link(chat_id: int, url: str, note: str):
         "forced":        forced_category,
         "ai_category":   ai_category,
         "related_pages": related_pages,
+        "maps_link":     maps_link,
     }
 
     emoji = CATEGORY_EMOJI.get(category, "📌")
-    text = (
-        f"🔍 *Analysis*\n\n"
-        f"*{name}*\n"
-        f"{emoji} Suggested: *{category.title()}*\n\n"
-        f"{summary}"
-    )
+    text = f"🔍 *Analysis*\n\n*{name}*"
+    if location:
+        text += f"\n📍 {location}"
+    text += f"\n{emoji} Suggested: *{category.title()}*\n\n{summary}"
+    if maps_link:
+        text += f"\n\n[📌 Open in Google Maps]({maps_link})"
 
     # Build smart button rows
     keyboard = []
