@@ -286,27 +286,51 @@ async def fetch_page_meta(url: str) -> dict:
 
 # ── Notion operations ─────────────────────────────────────────────────────────
 
-async def web_lookup(query: str) -> str:
-    """DuckDuckGo Instant Answer — free, no API key, good for well-known places."""
+async def web_search(query: str) -> str:
+    """
+    Search DuckDuckGo for review snippets.
+    Tries Instant Answer first (structured data), then falls back to HTML search
+    (gets real snippets from TripAdvisor, travel blogs, Google Maps listings, etc.)
+    """
+    parts = []
+
+    # 1. Instant Answer API — structured data for well-known places
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get("https://api.duckduckgo.com/",
                 params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"})
         if r.status_code == 200:
             d = r.json()
-            text = d.get("AbstractText") or d.get("Answer") or ""
-            extras = []
+            abstract = d.get("AbstractText") or d.get("Answer") or ""
+            if abstract:
+                parts.append(abstract)
             for entry in d.get("Infobox", {}).get("content", []):
-                label = entry.get("label", "")
-                value = entry.get("value", "")
-                if label and value and label.lower() in ("rating","address","phone","hours","price range"):
-                    extras.append(f"{label}: {value}")
-            if extras:
-                text = text + "\n" + "\n".join(extras) if text else "\n".join(extras)
-            return text[:600]
+                lbl = entry.get("label", "").lower()
+                val = entry.get("value", "")
+                if val and lbl in ("rating", "address", "phone", "hours", "price range"):
+                    parts.append(f"{lbl.title()}: {val}")
     except Exception:
         pass
-    return ""
+
+    # 2. HTML search — gets real review snippets from the web
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                         "Accept-Language": "en-US,en;q=0.9"}) as client:
+            r = await client.get("https://html.duckduckgo.com/html/",
+                params={"q": f"{query} reviews"})
+        if r.status_code == 200:
+            raw_snippets = re.findall(
+                r'class="result__snippet"[^>]*>(.*?)</(?:a|span)>', r.text, re.DOTALL)
+            for s in raw_snippets[:5]:
+                clean = re.sub(r'<[^>]+>', '', s)
+                clean = re.sub(r'\s+', ' ', clean).strip()
+                if clean and len(clean) > 25:
+                    parts.append(clean)
+    except Exception:
+        pass
+
+    return "\n".join(parts)[:1000]
 
 async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
     """Deep analysis: extract the actual subject, do a web lookup for extra details."""
@@ -322,7 +346,17 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
     if is_maps or place_hint:
         name_after_pin = re.search(r'📍\s*(\S[^,\n]{1,50})', title)
         candidate = name_after_pin.group(1).strip() if name_after_pin else title[:60]
-        web_info = await web_lookup(candidate)
+        # Extract location from Maps URL query for a better search
+        location_hint = ""
+        maps_url = meta.get("maps_url", "")
+        if maps_url:
+            qm = re.search(r'[?&]q=([^&#]+)', maps_url)
+            if qm:
+                full_q = unquote_plus(qm.group(1))
+                # Take everything after first comma as location context
+                parts_q = full_q.split(',')
+                location_hint = ", ".join(parts_q[1:3]).strip() if len(parts_q) > 1 else ""
+        web_info = await web_search(f"{candidate} {location_hint}".strip())
 
     meta_text = ""
     if title:
@@ -344,11 +378,12 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
         f"   • Video reviewing a product → category=product, name=the product\n"
         f"   • Use category=video ONLY if the video itself is what matters (tutorial, documentary)\n"
         f"2. Extract the EXACT name. If the title contains '📍Name' or 'bar Name' or 'restaurant Name', use that exact name.\n"
-        f"3. If web info has rating, address, or reviews — include them in the summary.\n"
-        f"4. Generate a maps_link: Google Maps search URL for the place (if it's a location).\n\n"
+        f"3. Extract the RATING from the web info if present (e.g. '4.5/5', '8.7/10', '4 stars').\n"
+        f"4. Summarise the REVIEW CONSENSUS — what do people say about it? Mention specific highlights or complaints.\n"
+        f"5. Generate a maps_link: Google Maps search URL for the place.\n\n"
         f"Categories: location, product, article, video, recipe, other\n\n"
         f"Return ONLY valid JSON, no markdown:\n"
-        f'{{"category":"...","name":"exact venue/dish/product name","location":"neighbourhood, city, country","type":"e.g. Beach bar, Sushi restaurant, Boutique hotel","vibe":"2-3 adjectives, e.g. laid-back, scenic, upscale","best_for":"what kind of visit/person, e.g. sunset drinks, solo travelers","summary":"3-5 sentences describing the place — what makes it special, atmosphere, must-tries, any review/rating highlights from the available info","rating":"score if found, else empty","maps_link":"https://www.google.com/maps/search/Name+City (URL-encode spaces as +)","search_terms":["term1","term2"]}}'
+        f'{{"category":"...","name":"exact venue/dish/product name","location":"neighbourhood, city, country","type":"e.g. Beach bar, Sushi restaurant, Boutique hotel","vibe":"2-3 adjectives","best_for":"e.g. sunset drinks, families, solo travelers","summary":"3-5 sentences: what makes it special, atmosphere, must-tries, and what reviews/visitors say about it","rating":"score if found in web info, else empty string","maps_link":"https://www.google.com/maps/search/Name+City","search_terms":["term1","term2"]}}'
     )
     raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=700)
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
