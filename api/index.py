@@ -178,8 +178,15 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
         f"Return ONLY valid JSON, no markdown:\n"
         f'{{ "category": "...", "name": "clean page title or place name", "summary": "2-3 sentence summary of what this is and why it might be useful" }}'
     )
-    text = await groq_chat([{"role": "user", "content": prompt}], max_tokens=300)
-    return json.loads(text)
+    raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=300)
+    # Strip markdown code fences if present
+    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
+    raw = re.sub(r"```$", "", raw.strip())
+    # Extract the first {...} block in case there's extra text
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        raw = m.group(0)
+    return json.loads(raw)
 
 async def notion_save_page(db_id: str, properties: dict) -> str:
     async with httpx.AsyncClient(timeout=15) as client:
@@ -387,6 +394,7 @@ async def handle_save_link(chat_id: int, url: str, note: str):
         {"text": "🔄 Change category", "callback_data": f"change:{pid}"},
         {"text": "❌ Cancel",          "callback_data": f"cancel:{pid}"},
     ]]
+    text += "\n\n_Or just describe what you want — e.g. \"save as recipe\" or \"add note: try next summer\"_"
     await tg_send_buttons(chat_id, text, keyboard)
 
 
