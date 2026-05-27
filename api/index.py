@@ -695,6 +695,25 @@ async def notion_read_page_content(page_id: str, max_chars: int = 3000, _depth: 
                     sub = await notion_read_page_content(block["id"], max_chars=4000, _depth=_depth + 1)
                     if sub:
                         lines.append(sub)
+            elif btype == "table":
+                # Tables: rows are child blocks of type table_row
+                if block.get("has_children"):
+                    try:
+                        async with httpx.AsyncClient(timeout=10) as tc:
+                            tr = await tc.get(
+                                f"https://api.notion.com/v1/blocks/{block['id']}/children?page_size=50",
+                                headers=NOTION_HEADERS)
+                        for row_block in tr.json().get("results", []):
+                            if row_block.get("type") == "table_row":
+                                cells = row_block["table_row"].get("cells", [])
+                                row_text = " | ".join(
+                                    "".join(t.get("plain_text", "") for t in cell)
+                                    for cell in cells
+                                )
+                                if row_text.strip():
+                                    lines.append(row_text)
+                    except Exception:
+                        pass
             else:
                 if text: lines.append(text)
 
