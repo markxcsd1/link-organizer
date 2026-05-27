@@ -72,6 +72,14 @@ Just talk to me in natural language — I'll search your knowledge base and answ
 def _rich_text(value: str) -> list:
     return [{"text": {"content": value[:2000]}}]
 
+def _clean_field(val: str) -> str:
+    """Strip Groq 'not found' placeholder values."""
+    if not val:
+        return ""
+    if re.search(r'\b(not found|not specified|not available|unknown|n/a)\b', val, re.IGNORECASE):
+        return ""
+    return val
+
 def _extract_json(text: str) -> str:
     """Extract the first complete JSON object by counting balanced braces."""
     start = text.find('{')
@@ -423,9 +431,10 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
         f"   • Video reviewing a product → category=product, name=the product\n"
         f"   • Use category=video ONLY if the video itself is what matters (tutorial, documentary)\n"
         f"2. Extract the EXACT name. If the title contains '📍Name' or 'bar Name' or 'restaurant Name', use that exact name.\n"
-        f"3. Extract the RATING from the web info if present (e.g. '4.5/5', '8.7/10', '4 stars'). Leave empty if not found.\n"
+        f"3. Extract the RATING from the web info if present (e.g. '4.5/5', '8.7/10', '4 stars'). Leave empty string if not found.\n"
         f"4. Summarise the REVIEW CONSENSUS using ONLY facts from the web info above. "
         f"If web info is empty or has no reviews, write a factual one-line description only — NEVER invent ratings, visitor quotes, or review summaries.\n"
+        f"5. For ALL fields: if data is unavailable, use an empty string \"\". NEVER write 'not found', 'unknown', 'not specified', 'not available', 'N/A', or any similar phrase.\n"
         f"5. Generate a maps_link: Google Maps search URL for the place.\n\n"
         f"Categories: location, product, article, video, recipe, other\n\n"
         f"Return ONLY valid JSON, no markdown:\n"
@@ -507,8 +516,8 @@ async def notion_find_related(search_terms: list) -> list:
             pass
     return related[:4]
 
-async def notion_read_page_content(page_id: str, max_chars: int = 3000) -> str:
-    """Read the text content of a Notion page (its blocks)."""
+async def notion_read_page_content(page_id: str, max_chars: int = 3000, _depth: int = 0) -> str:
+    """Read the text content of a Notion page (its blocks), recursing into toggles and child pages."""
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(
@@ -522,20 +531,42 @@ async def notion_read_page_content(page_id: str, max_chars: int = 3000) -> str:
             bdata = block.get(btype, {})
             rt = bdata.get("rich_text", [])
             text = "".join(t.get("plain_text", "") for t in rt)
-            if not text:
-                continue
+
             if btype in ("heading_1", "heading_2", "heading_3"):
-                lines.append(f"{'#' * int(btype[-1])} {text}")
-            elif btype in ("bulleted_list_item",):
-                lines.append(f"• {text}")
+                if text: lines.append(f"{'#' * int(btype[-1])} {text}")
+            elif btype == "bulleted_list_item":
+                if text: lines.append(f"• {text}")
             elif btype == "numbered_list_item":
-                lines.append(f"- {text}")
+                if text: lines.append(f"- {text}")
             elif btype == "to_do":
-                lines.append(f"{'✓' if bdata.get('checked') else '○'} {text}")
+                if text: lines.append(f"{'✓' if bdata.get('checked') else '○'} {text}")
             elif btype == "callout":
-                lines.append(f"📌 {text}")
+                if text: lines.append(f"📌 {text}")
+            elif btype == "child_page":
+                # Inline sub-page: include its title as a heading then recurse (max 1 level deep)
+                child_title = bdata.get("title", "")
+                if child_title:
+                    lines.append(f"## {child_title}")
+                if _depth < 1:
+                    sub = await notion_read_page_content(block["id"], max_chars=800, _depth=_depth + 1)
+                    if sub:
+                        lines.append(sub)
+            elif btype == "toggle":
+                # Toggle block: show the label then recurse into hidden children
+                if text: lines.append(f"▸ {text}")
+                if _depth < 1 and block.get("has_children"):
+                    sub = await notion_read_page_content(block["id"], max_chars=600, _depth=_depth + 1)
+                    if sub:
+                        lines.append(sub)
+            elif btype == "column_list":
+                # Recurse into columns
+                if _depth < 1 and block.get("has_children"):
+                    sub = await notion_read_page_content(block["id"], max_chars=400, _depth=_depth + 1)
+                    if sub:
+                        lines.append(sub)
             else:
-                lines.append(text)
+                if text: lines.append(text)
+
         return "\n".join(lines)[:max_chars]
     except Exception:
         return ""
@@ -756,11 +787,11 @@ async def handle_save_link(chat_id: int, url: str, note: str):
         category = "other"
 
     name      = result.get("name", meta.get("title", ""))[:200] or url
-    location  = result.get("location", "")
-    type_     = result.get("type", "")
-    vibe      = result.get("vibe", "")
-    best_for  = result.get("best_for", "")
-    rating    = result.get("rating", "")
+    location  = _clean_field(result.get("location", ""))
+    type_     = _clean_field(result.get("type", ""))
+    vibe      = _clean_field(result.get("vibe", ""))
+    best_for  = _clean_field(result.get("best_for", ""))
+    rating    = _clean_field(result.get("rating", ""))
     maps_link = meta.get("maps_url") or result.get("maps_link", "")
     summary   = result.get("summary", "")[:600]
     if clean_note:
@@ -999,9 +1030,10 @@ async def handle_pending_modification(chat_id: int, text: str, pid: str, pending
         f"The user has a pending save action:\n{current}\n\n"
         f"The user said: \"{text}\"\n\n"
         f"Determine their intent. Return ONLY valid JSON:\n"
-        f'{{"action": "save", "category": "...", "name": "...", "notes": "..."}}\n'
-        f"action must be one of: save, cancel, modify\n"
+        f'{{"action": "save", "category": "...", "name": "...", "notes": "...", "page": ""}}\n'
+        f"action must be one of: save, addto, cancel, modify\n"
         f"- save: user said ok/yes/save/go ahead — keep all current values\n"
+        f"- addto: user wants to save to a specific named page/list (e.g. 'save to my Sifnos list', 'add to Tokyo'). Set page to the page name.\n"
         f"- cancel: user wants to cancel\n"
         f"- modify: user wants to change something — update only the mentioned fields, keep others unchanged\n"
         f"Valid categories: location, product, article, video, recipe, other"
@@ -1021,6 +1053,34 @@ async def handle_pending_modification(chat_id: int, text: str, pid: str, pending
         PENDING.pop(pid, None)
         await tg_send(chat_id, "❌ Cancelled.")
         return
+
+    if action == "addto":
+        page_query = result.get("page", "").strip()
+        if not page_query:
+            # Fall through to normal save
+            action = "save"
+        else:
+            pages = await notion_search(page_query)
+            # Pick best match: prefer exact title match, else first result
+            target = next((p for p in pages if page_query.lower() in p["title"].lower()), None)
+            target = target or (pages[0] if pages else None)
+            if not target:
+                await tg_send(chat_id, f"❌ Couldn't find a Notion page called \"{page_query}\".")
+                return
+            pending_item = PENDING.pop(pid, None)
+            if not pending_item:
+                return
+            await tg_send(chat_id, f"➕ Adding to \"{target['title']}\"…")
+            try:
+                notion_url = await notion_append_to_page(
+                    target["id"], pending_item["name"], pending_item["url"], pending_item["notes"])
+                await save_log(pending_item["url"], pending_item["notes"], pending_item["forced"],
+                               pending_item["ai_category"], pending_item["category"], pending_item["name"], "✓ success (addto)")
+                await tg_send(chat_id,
+                    f"✅ *Added to \"{target['title']}\"*\n\n*{pending_item['name']}*\n\n[Open in Notion]({notion_url})")
+            except Exception as e:
+                await tg_send(chat_id, f"❌ Failed: {e}")
+            return
 
     if action == "save":
         PENDING.pop(pid, None)
