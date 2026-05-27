@@ -9,6 +9,7 @@ from api.index import (
     _extract_json,
     _clean_field,
     _clean_topic_name,
+    _detect_addto_intent,
     _map_type,
     parse_command,
     _rich_text,
@@ -197,6 +198,38 @@ class TestCleanTopicName:
     ])
     def test_normalises(self, raw, expected):
         assert _clean_topic_name(raw) == expected
+
+
+# ── _detect_addto_intent ──────────────────────────────────────────────────────
+
+class TestDetectAddtoIntent:
+    @pytest.mark.parametrize("text,topic", [
+        ("Save it in Sifnos",            "Sifnos"),
+        ("save in Tokyo",                "Tokyo"),
+        ("add to Amorgos",               "Amorgos"),
+        ("Add it to Amorgos",            "Amorgos"),
+        ("save to my Sifnos list",       "Sifnos"),
+        ("Save to the Tokyo page",       "Tokyo"),
+        ("put it under Japan trip",      "Japan"),
+        ("stash this in the Bucket list","Bucket"),
+        ("store it in Athens",           "Athens"),
+        ("drop this into Concerts",      "Concerts"),
+    ])
+    def test_extracts_topic(self, text, topic):
+        assert _detect_addto_intent(text) == topic
+
+    @pytest.mark.parametrize("text", [
+        "Save",
+        "save it",
+        "ok save it",                  # doesn't start with verb
+        "cancel",
+        "yes",
+        "change category to video",
+        "Sifnos",                      # no verb at all
+        "",
+    ])
+    def test_returns_none(self, text):
+        assert _detect_addto_intent(text) is None
 
 
 # ── _map_type new types ───────────────────────────────────────────────────────
