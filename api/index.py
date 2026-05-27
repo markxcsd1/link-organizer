@@ -42,6 +42,10 @@ NOTION_HEADERS = {
 # In-memory store for pending confirmations (works for single-user bot)
 PENDING: dict = {}
 
+# Conversation history per chat (keeps last 10 messages for context)
+CHAT_HISTORY: dict = {}
+MAX_HISTORY = 10
+
 HELP_TEXT = """*Your personal knowledge assistant* 🧠
 
 *Save a link:*
@@ -983,22 +987,36 @@ async def handle_create_note(chat_id: int, content: str):
 
 
 async def handle_chat(chat_id: int, text: str):
+    # Maintain conversation history
+    history = CHAT_HISTORY.setdefault(chat_id, [])
+    history.append({"role": "user", "content": text})
+    if len(history) > MAX_HISTORY:
+        CHAT_HISTORY[chat_id] = history[-MAX_HISTORY:]
+    history = CHAT_HISTORY[chat_id]
+
+    # Extract search keywords from the FULL conversation context, not just the current message
+    # This handles follow-ups like "And then?" or "What about after that?"
+    conversation_context = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in history[-6:])
     search_query = text
     try:
         kw = await groq_chat([{"role": "user", "content":
-            f"Extract 1-3 search keywords from this message. Return ONLY the keywords, nothing else.\n\nMessage: {text}"}],
-            max_tokens=30)
+            f"Based on this conversation, extract 2-4 Notion search keywords that would find relevant content.\n"
+            f"Focus on the TOPIC being discussed (places, events, dates, names), not filler words.\n"
+            f"Return ONLY the keywords, nothing else.\n\n"
+            f"Conversation:\n{conversation_context}"}],
+            max_tokens=40)
         if kw:
             search_query = kw.strip()
     except Exception:
         pass
 
+    # Search Notion with extracted keywords
     context_lines = []
     try:
         notion_results = await notion_search(search_query)
         if notion_results:
-            context_lines.append("Relevant items from the user's Notion knowledge base:")
-            for r in notion_results[:6]:
+            context_lines.append("Relevant items from the user's Notion:")
+            for r in notion_results[:8]:
                 line = f"- {r['title']}"
                 if r.get("url"):
                     line += f" ({r['url']})"
@@ -1006,8 +1024,9 @@ async def handle_chat(chat_id: int, text: str):
     except Exception:
         pass
 
+    # Also pull recent saves for general context
     try:
-        recent = await notion_list_recent(limit=5)
+        recent = await notion_list_recent(limit=8)
         if recent:
             context_lines.append("\nRecently saved:")
             for p in recent:
@@ -1015,21 +1034,29 @@ async def handle_chat(chat_id: int, text: str):
     except Exception:
         pass
 
-    knowledge_context = "\n".join(context_lines) if context_lines else "No items found."
+    knowledge_context = "\n".join(context_lines) if context_lines else "No items found in Notion."
 
     system = (
-        "You are a personal knowledge assistant with direct access to the user's Notion knowledge base.\n\n"
-        f"{knowledge_context}\n\n"
-        "Answer the user's question using the above data. Be specific and reference actual items when relevant. "
-        "If the user asks to find something not in the results, tell them to try /search <query>. "
-        "Keep responses concise. Use plain text, no markdown formatting."
+        "You are a personal knowledge assistant with direct access to the user's Notion.\n\n"
+        f"NOTION DATA:\n{knowledge_context}\n\n"
+        "Rules:\n"
+        "- Answer using the Notion data above. Be specific, reference actual items.\n"
+        "- For follow-up questions (e.g. 'And then?', 'What's next?', 'After that?'), "
+        "use the conversation history to understand what the user is asking about.\n"
+        "- If something isn't in the data, say so and suggest /search <keyword>.\n"
+        "- Be concise. Plain text only, no markdown."
     )
+
+    # Build message list with full conversation history for context
+    messages = [{"role": "system", "content": system}]
+    messages.extend(history[:-1])   # previous turns
+    messages.append({"role": "user", "content": text})
+
     try:
-        response = await groq_chat([
-            {"role": "system", "content": system},
-            {"role": "user", "content": text},
-        ])
+        response = await groq_chat(messages, max_tokens=600)
         await tg_send(chat_id, response)
+        # Store assistant reply in history
+        history.append({"role": "assistant", "content": response})
     except Exception as e:
         await tg_send(chat_id, f"❌ Error: {e}")
 
