@@ -48,6 +48,9 @@ PENDING: dict = {}
 CHAT_HISTORY: dict = {}
 MAX_HISTORY = 10
 
+# Cached "Bucket list" page id for the lifetime of this serverless invocation
+_BUCKET_LIST_ID: str | None = None
+
 HELP_TEXT = """*Your personal knowledge assistant* 🧠
 
 *Save a link:*
@@ -62,6 +65,11 @@ After analysis, say *"save in my Sifnos list"* to add to a trip\\.
 *Recent saves:*
 `/list` — show last 10 saves
 `/list articles` — filter by category
+
+*Topic lists:*
+`/in <topic>` — list everything saved under that topic, e\\.g\\. `/in sifnos`
+`/in <topic> <type>` — filter by type, e\\.g\\. `/in tokyo restaurant`
+Or just ask: *"what restaurants do I have in Tokyo?"*
 
 *Trip places database:*
 `/setupdb` — create the Trip Places database in Notion \\(one\\-time setup\\)
@@ -529,13 +537,36 @@ async def notion_fetch_page_meta(page_id: str) -> dict:
     except Exception:
         return {}
 
-async def notion_query_db_rows(db_id: str, limit: int = 20) -> list:
-    """Query all rows of an island/trip database."""
+async def notion_query_db_rows(
+    db_id: str,
+    limit: int = 20,
+    type_filter: str | None = None,
+    location_contains: str | None = None,
+) -> list:
+    """Query rows of a topic/trip database, optionally filtered.
+
+    - type_filter: matches Type select exactly (e.g. "Restaurant")
+    - location_contains: substring match on Location rich_text
+    """
+    body: dict = {
+        "sorts": [{"property": "Name", "direction": "ascending"}],
+        "page_size": limit,
+    }
+    filters = []
+    if type_filter:
+        filters.append({"property": "Type", "select": {"equals": type_filter}})
+    if location_contains:
+        filters.append({"property": "Location", "rich_text": {"contains": location_contains}})
+    if len(filters) == 1:
+        body["filter"] = filters[0]
+    elif len(filters) > 1:
+        body["filter"] = {"and": filters}
+
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
             f"https://api.notion.com/v1/databases/{db_id}/query",
             headers=NOTION_HEADERS,
-            json={"sorts": [{"property": "Name", "direction": "ascending"}], "page_size": limit},
+            json=body,
         )
     if r.status_code != 200:
         return []
@@ -566,8 +597,16 @@ _TYPE_MAP = {
     "shop": "Shop", "store": "Shop", "market": "Shop",
     "church": "Sight", "monastery": "Sight", "castle": "Sight", "ruins": "Sight",
     "sight": "Sight", "viewpoint": "Sight",
+    # broader topic-DB types (also held by Bucket-list DBs)
+    "place": "Place", "spot": "Place",
+    "event": "Event", "concert": "Event", "show": "Event",
+    "festival": "Festival",
+    "activity": "Activity", "experience": "Activity", "tour": "Activity", "hike": "Activity",
 }
-_VALID_TYPES = {"Restaurant","Bar","Cafe","Beach","Hotel","Village","Museum","Shop","Sight","Other"}
+_VALID_TYPES = {
+    "Place","Restaurant","Bar","Cafe","Beach","Hotel","Village","Museum","Shop","Sight",
+    "Event","Festival","Activity","Other",
+}
 
 def _map_type(raw: str) -> str:
     if not raw:
@@ -612,6 +651,10 @@ async def insert_into_trip_db(db_id: str, pending: dict) -> str:
         props["Vibe"]     = {"rich_text": _rich_text(vibe)}
     if best_for:
         props["Best For"] = {"rich_text": _rich_text(best_for)}
+    # Optional Date — only set if the analyzer/user supplied an ISO date string
+    date_val = pending.get("date", "")
+    if date_val:
+        props["Date"] = {"date": {"start": date_val}}
 
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
@@ -781,39 +824,109 @@ async def notion_append_to_page(page_id: str, name: str, link_url: str, summary:
 
 # ── Trip Places database ──────────────────────────────────────────────────────
 
-async def notion_create_trip_db() -> str:
-    """Create the Trip Places database at workspace root and return its ID."""
+# Schema shared by topic DBs (bucket-list DBs and the legacy Trip Places DB)
+_TOPIC_DB_TYPE_OPTIONS = [
+    {"name": "Place",      "color": "default"},
+    {"name": "Restaurant", "color": "orange"},
+    {"name": "Bar",        "color": "purple"},
+    {"name": "Cafe",       "color": "yellow"},
+    {"name": "Beach",      "color": "blue"},
+    {"name": "Hotel",      "color": "green"},
+    {"name": "Village",    "color": "pink"},
+    {"name": "Museum",     "color": "brown"},
+    {"name": "Shop",       "color": "red"},
+    {"name": "Sight",      "color": "default"},
+    {"name": "Event",      "color": "gray"},
+    {"name": "Festival",   "color": "pink"},
+    {"name": "Activity",   "color": "blue"},
+    {"name": "Other",      "color": "default"},
+]
+
+
+async def notion_create_topic_db(parent_page_id: str | None, title: str) -> str:
+    """Create a topic-scoped database with the standard flexible schema.
+
+    If parent_page_id is None, the DB is created at workspace root (used by /setupdb
+    for the legacy Trip Places DB). Otherwise it's nested under that page — this is
+    how bucket-list DBs (e.g. 'Tokyo', 'Japan trip') are created.
+    """
+    if parent_page_id:
+        parent = {"type": "page_id", "page_id": parent_page_id}
+    else:
+        parent = {"type": "workspace", "workspace": True}
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
             "https://api.notion.com/v1/databases",
             headers=NOTION_HEADERS,
             json={
-                "parent": {"type": "workspace", "workspace": True},
-                "title": [{"type": "text", "text": {"content": "🗺️ Trip Places"}}],
+                "parent": parent,
+                "title": [{"type": "text", "text": {"content": title}}],
                 "properties": {
                     "Name":     {"title": {}},
                     "URL":      {"url": {}},
                     "Maps":     {"url": {}},
-                    "Type":     {"select": {"options": [
-                        {"name": "Restaurant", "color": "orange"},
-                        {"name": "Bar",        "color": "purple"},
-                        {"name": "Cafe",       "color": "yellow"},
-                        {"name": "Beach",      "color": "blue"},
-                        {"name": "Hotel",      "color": "green"},
-                        {"name": "Village",    "color": "pink"},
-                        {"name": "Museum",     "color": "brown"},
-                        {"name": "Shop",       "color": "red"},
-                        {"name": "Other",      "color": "default"},
-                    ]}},
+                    "Type":     {"select": {"options": _TOPIC_DB_TYPE_OPTIONS}},
                     "Location": {"rich_text": {}},
+                    "Date":     {"date": {}},
                     "Rating":   {"rich_text": {}},
                     "Notes":    {"rich_text": {}},
-                    "Trip":     {"select": {}},
+                    "Vibe":     {"rich_text": {}},
+                    "Best For": {"rich_text": {}},
                 },
             },
         )
     r.raise_for_status()
     return r.json()["id"]
+
+
+async def notion_create_trip_db() -> str:
+    """Legacy: create the Trip Places DB at workspace root. Used by /setupdb."""
+    return await notion_create_topic_db(None, "🗺️ Trip Places")
+
+
+def _clean_topic_name(raw: str) -> str:
+    """Normalize a user-supplied topic to a clean DB title.
+
+    - Strips leading/trailing whitespace
+    - Removes emoji and other non-letter/digit/space punctuation at the edges
+    - Collapses multiple spaces
+    - Title-cases multi-word names but preserves common ALL-CAPS acronyms (NYC, US, UK, etc.)
+    """
+    if not raw:
+        return ""
+    # Strip everything that isn't a letter or digit from the edges (kills emoji/punct)
+    s = re.sub(r"^[^\w]+|[^\w]+$", "", raw, flags=re.UNICODE).strip()
+    # Collapse internal whitespace
+    s = re.sub(r"\s+", " ", s)
+    if not s:
+        return ""
+    # Title-case, but keep short ALL-CAPS tokens as-is (e.g. NYC, LA, USA)
+    parts = []
+    for word in s.split(" "):
+        if word.isupper() and 2 <= len(word) <= 4:
+            parts.append(word)
+        else:
+            parts.append(word.capitalize())
+    return " ".join(parts)
+
+
+async def notion_find_bucket_list() -> str | None:
+    """Find the user's 'Bucket list' page id. Caches the result per invocation."""
+    global _BUCKET_LIST_ID
+    if _BUCKET_LIST_ID:
+        return _BUCKET_LIST_ID
+    try:
+        results = await notion_search("Bucket list")
+        for r in results:
+            if r.get("object") != "page":
+                continue
+            title = (r.get("title") or "").strip().lower()
+            if title == "bucket list" or title.startswith("bucket list") or title.startswith("bucket"):
+                _BUCKET_LIST_ID = r["id"]
+                return _BUCKET_LIST_ID
+    except Exception:
+        pass
+    return None
 
 
 async def trip_places_add(pending: dict, trip_name: str) -> str:
@@ -1332,7 +1445,25 @@ async def handle_pending_modification(chat_id: int, text: str, pid: str, pending
                 target = next((p for p in pages if page_query.lower() in p["title"].lower()), None)
                 target = target or (pages[0] if pages else None)
                 if not target:
-                    await tg_send(chat_id, f"❌ Couldn't find \"{page_query}\" in Notion.")
+                    # Nothing matched — auto-create a topic DB under "Bucket list" if it exists
+                    bucket_id = await notion_find_bucket_list()
+                    if not bucket_id:
+                        await tg_send(chat_id,
+                            f"❌ Couldn't find \"{page_query}\" in Notion, and no \"Bucket list\" page either.")
+                        return
+                    topic_title = _clean_topic_name(page_query) or page_query
+                    try:
+                        new_db_id = await notion_create_topic_db(bucket_id, topic_title)
+                    except Exception as e:
+                        await tg_send(chat_id, f"❌ Could not create new DB for \"{topic_title}\": {e}")
+                        return
+                    notion_url = await insert_into_trip_db(new_db_id, pending_item)
+                    await save_log(pending_item["url"], pending_item["notes"], pending_item.get("forced"),
+                                   pending_item.get("ai_category", ""), pending_item.get("category", ""),
+                                   pending_item["name"], "✓ success (new bucket-list DB)")
+                    await tg_send(chat_id,
+                        f"📁 Created new database *{topic_title}* under Bucket list and saved "
+                        f"*{pending_item['name']}* in it.\n\n[Open in Notion]({notion_url})")
                     return
                 label = target["title"]
                 if target.get("object") == "database":
@@ -1483,6 +1614,55 @@ async def handle_create_note(chat_id: int, content: str):
     await tg_send_buttons(chat_id, text, keyboard)
 
 
+async def _handle_list_query(chat_id: int, topic: str, type_filter: str | None) -> bool:
+    """Try to answer 'what do I have in <topic>' as a clean list of DB rows.
+
+    Returns True if it handled the query (sent a Telegram message), False if it
+    couldn't find a matching DB and the caller should fall through to chat.
+    """
+    if not topic:
+        return False
+    type_norm = _map_type(type_filter) if type_filter else None
+    try:
+        # 1. Find a database whose title matches the topic
+        results = await notion_search(topic)
+        db_target = next(
+            (r for r in results
+             if r.get("object") == "database" and topic.lower() in (r.get("title") or "").lower()),
+            None,
+        )
+        # 2. Fall back to ANY database whose title matches the topic
+        if not db_target:
+            db_target = next((r for r in results if r.get("object") == "database"), None)
+        if not db_target:
+            return False
+        rows = await notion_query_db_rows(db_target["id"], limit=50, type_filter=type_norm)
+        if not rows:
+            label = db_target.get("title", topic)
+            filt_suffix = f" of type *{type_norm}*" if type_norm else ""
+            await tg_send(chat_id, f"📭 *{label}* has no items{filt_suffix} yet.")
+            return True
+        label = db_target.get("title", topic)
+        filt_suffix = f" — {type_norm}s only" if type_norm else ""
+        lines = [f"*{label}*{filt_suffix} ({len(rows)} items):"]
+        for i, row in enumerate(rows, start=1):
+            line = f"{i}. *{row['name']}*"
+            extras = []
+            if row.get("type") and not type_norm:
+                extras.append(row["type"])
+            if row.get("location"):
+                extras.append(row["location"])
+            if row.get("rating"):
+                extras.append(f"⭐ {row['rating']}")
+            if extras:
+                line += " — " + ", ".join(extras)
+            lines.append(line)
+        await tg_send(chat_id, "\n".join(lines))
+        return True
+    except Exception:
+        return False
+
+
 async def handle_chat(chat_id: int, text: str):
     # Maintain conversation history
     history = CHAT_HISTORY.setdefault(chat_id, [])
@@ -1490,6 +1670,36 @@ async def handle_chat(chat_id: int, text: str):
     if len(history) > MAX_HISTORY:
         CHAT_HISTORY[chat_id] = history[-MAX_HISTORY:]
     history = CHAT_HISTORY[chat_id]
+
+    # Intent classifier: detect "what do I have in X" / "show me X" / list-style queries.
+    # These get a clean numbered list instead of AI prose.
+    try:
+        intent_raw = await groq_chat(
+            [{"role": "user", "content":
+                "Classify the user's message. Return ONLY JSON, no prose.\n"
+                'Schema: {"intent": "list" | "chat", "topic": "<place or topic or null>", '
+                '"type_filter": "<one of: Restaurant, Bar, Cafe, Beach, Hotel, Village, Museum, Shop, Sight, Place, Event, Festival, Activity, or null>"}\n'
+                "Use intent='list' ONLY for questions like 'what do I have in <place>', "
+                "'show me my <X> in <place>', 'list <X> in <place>', or 'what's on my <place> list'. "
+                "If the user is asking a general question or follow-up, use intent='chat'.\n\n"
+                f"Message: {text}"}],
+            max_tokens=80,
+        )
+        intent_raw = re.sub(r"^```[a-z]*\n?", "", intent_raw.strip(), flags=re.IGNORECASE)
+        intent_raw = re.sub(r"```$", "", intent_raw.strip())
+        intent = json.loads(_extract_json(intent_raw))
+    except Exception:
+        intent = {"intent": "chat"}
+
+    if intent.get("intent") == "list" and intent.get("topic"):
+        handled = await _handle_list_query(
+            chat_id,
+            topic=intent["topic"],
+            type_filter=intent.get("type_filter"),
+        )
+        if handled:
+            # Don't pollute conversation history with list results — they're complete answers
+            return
 
     # Extract TWO search angles in parallel and union the results.
     # - question_kw: keywords from the current question (catches direct title matches)
@@ -1723,6 +1933,26 @@ async def telegram_webhook(req: Request):
             category = category[:-1]
         await handle_list(chat_id, category if category in NOTION_DB else None)
 
+    elif text.startswith("/in "):
+        # /in <topic>          → show all items in that topic's DB
+        # /in <topic> <type>   → filter by type, e.g. "/in sifnos bar"
+        rest = text[4:].strip()
+        if not rest:
+            await tg_send(chat_id, "Usage: `/in <topic>` or `/in <topic> <type>`")
+        else:
+            # Try splitting off a trailing type token (last word) if it maps to a valid type
+            type_filter = None
+            topic = rest
+            tokens = rest.rsplit(None, 1)
+            if len(tokens) == 2:
+                maybe_type = tokens[1].rstrip("s")  # strip plural
+                if _map_type(maybe_type) and _map_type(maybe_type) != "Other":
+                    type_filter = maybe_type
+                    topic = tokens[0]
+            handled = await _handle_list_query(chat_id, topic, type_filter)
+            if not handled:
+                await tg_send(chat_id, f"❌ Couldn't find a list/database for *{topic}*.")
+
     elif text.startswith("/note "):
         await handle_create_note(chat_id, text[6:].strip())
 
@@ -1790,4 +2020,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "db-meta-400"}
+    return {"ok": True, "v": "bucket-list"}

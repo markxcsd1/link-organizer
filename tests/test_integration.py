@@ -19,6 +19,7 @@ from api.index import (
     insert_into_trip_db,
     notion_read_page_content,
     notion_fetch_page_meta,
+    notion_create_topic_db,
     _map_type,
 )
 
@@ -346,3 +347,75 @@ class TestNotionFetchPageMeta:
         assert meta["id"] == db_id
         assert meta["title"] == "⛵ Sifnos — Jul 17–20"
         assert meta["parent"] == {"type": "page_id", "page_id": "summer-2026"}
+
+
+# ── notion_create_topic_db: bucket-list DB creation ───────────────────────────
+
+class TestNotionCreateTopicDb:
+    @respx.mock
+    async def test_creates_under_parent_page(self):
+        """When given a parent_page_id, the DB must be created with the right parent
+        shape AND include the broader Type select options (Event, Festival, Activity)."""
+        route = respx.post("https://api.notion.com/v1/databases").mock(
+            return_value=httpx.Response(200, json={"id": "new-db-id"}))
+        db_id = await notion_create_topic_db("bucket-list-page-123", "Tokyo")
+        assert db_id == "new-db-id"
+        body = json.loads(route.calls[0].request.content)
+        assert body["parent"] == {"type": "page_id", "page_id": "bucket-list-page-123"}
+        assert body["title"][0]["text"]["content"] == "Tokyo"
+        type_names = [o["name"] for o in body["properties"]["Type"]["select"]["options"]]
+        # the new options must be present
+        for must_have in ("Place", "Event", "Festival", "Activity", "Restaurant"):
+            assert must_have in type_names, f"Type option {must_have!r} missing"
+        # and Date property must be there
+        assert "Date" in body["properties"]
+        assert body["properties"]["Date"] == {"date": {}}
+
+    @respx.mock
+    async def test_creates_at_workspace_root_when_no_parent(self):
+        """Backward compat: notion_create_trip_db() passes None and gets workspace root."""
+        route = respx.post("https://api.notion.com/v1/databases").mock(
+            return_value=httpx.Response(200, json={"id": "ws-db"}))
+        db_id = await notion_create_topic_db(None, "🗺️ Trip Places")
+        assert db_id == "ws-db"
+        body = json.loads(route.calls[0].request.content)
+        assert body["parent"] == {"type": "workspace", "workspace": True}
+
+
+# ── notion_query_db_rows: filtering ───────────────────────────────────────────
+
+class TestNotionQueryFilters:
+    @respx.mock
+    async def test_type_filter_shapes_request(self):
+        route = respx.post("https://api.notion.com/v1/databases/db-1/query").mock(
+            return_value=httpx.Response(200, json={"results": []}))
+        await notion_query_db_rows("db-1", type_filter="Restaurant")
+        body = json.loads(route.calls[0].request.content)
+        assert body["filter"] == {"property": "Type", "select": {"equals": "Restaurant"}}
+
+    @respx.mock
+    async def test_location_filter_shapes_request(self):
+        route = respx.post("https://api.notion.com/v1/databases/db-1/query").mock(
+            return_value=httpx.Response(200, json={"results": []}))
+        await notion_query_db_rows("db-1", location_contains="Tokyo")
+        body = json.loads(route.calls[0].request.content)
+        assert body["filter"] == {"property": "Location", "rich_text": {"contains": "Tokyo"}}
+
+    @respx.mock
+    async def test_both_filters_combine_with_and(self):
+        route = respx.post("https://api.notion.com/v1/databases/db-1/query").mock(
+            return_value=httpx.Response(200, json={"results": []}))
+        await notion_query_db_rows("db-1", type_filter="Bar", location_contains="Athens")
+        body = json.loads(route.calls[0].request.content)
+        assert "and" in body["filter"]
+        assert len(body["filter"]["and"]) == 2
+
+    @respx.mock
+    async def test_no_filter_keeps_legacy_body(self):
+        """Backward compat: no filter args → no 'filter' key in the request body."""
+        route = respx.post("https://api.notion.com/v1/databases/db-1/query").mock(
+            return_value=httpx.Response(200, json={"results": []}))
+        await notion_query_db_rows("db-1")
+        body = json.loads(route.calls[0].request.content)
+        assert "filter" not in body
+        assert body["sorts"] == [{"property": "Name", "direction": "ascending"}]
