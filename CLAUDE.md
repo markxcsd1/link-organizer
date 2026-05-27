@@ -12,6 +12,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 iOS Share Sheet → Vercel API → Groq (Llama 3.1 8B) classification → Notion database storage. Users share any link from their iPhone; the API classifies it and saves it to one of 6 Notion databases.
 
+## Notion conventions
+
+- The user keeps a top-level Notion page literally titled **"Bucket list"**. When the user asks to save something to a topic that doesn't exist yet (e.g. "save it to Tokyo"), the bot creates a new database with that topic name *under Bucket list* and saves there. Locate it via `notion_find_bucket_list()` — never hardcode the page id.
+- Topic DBs (Bucket-list DBs and trip DBs like "Sifnos") share one schema, defined in `_TOPIC_DB_TYPE_OPTIONS` and `notion_create_topic_db()`. Inserts go through `insert_into_trip_db()`.
+- Trip DBs (e.g. "⛵ Sifnos — Jul 17–20") may live under any parent page (the user has them under "☀️ Summer 2026"); they are NOT moved into Bucket list automatically.
+- Working-state checkpoint: tag `v1-chat-works` at the commit where chat answers ferry/itinerary questions reliably.
+
 ## Development Commands
 
 ```bash

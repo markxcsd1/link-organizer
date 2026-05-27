@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from api.index import (
     _extract_json,
     _clean_field,
+    _clean_topic_name,
     _map_type,
     parse_command,
     _rich_text,
@@ -177,6 +178,41 @@ class TestRichText:
         long = "x" * 3000
         rt = _rich_text(long)
         assert len(rt[0]["text"]["content"]) == 2000
+
+
+# ── _clean_topic_name ─────────────────────────────────────────────────────────
+
+class TestCleanTopicName:
+    @pytest.mark.parametrize("raw,expected", [
+        ("  TOKYO 🗼 ",       "Tokyo"),
+        ("tokyo",             "Tokyo"),
+        ("Tokyo",             "Tokyo"),
+        ("  new   york  ",    "New York"),
+        ("NYC",               "NYC"),         # short ALL-CAPS preserved
+        ("USA",               "USA"),
+        ("LA",                "LA"),
+        ("✈️ japan trip 🇯🇵", "Japan Trip"),
+        ("",                  ""),
+        ("   ",               ""),
+    ])
+    def test_normalises(self, raw, expected):
+        assert _clean_topic_name(raw) == expected
+
+
+# ── _map_type new types ───────────────────────────────────────────────────────
+
+class TestMapTypeNewTypes:
+    @pytest.mark.parametrize("raw,expected", [
+        ("Event",      "Event"),
+        ("Festival",   "Festival"),
+        ("Activity",   "Activity"),
+        ("Place",      "Place"),
+        ("concert",    "Event"),
+        ("hike",       "Activity"),
+        ("tour",       "Activity"),
+    ])
+    def test_new_types(self, raw, expected):
+        assert _map_type(raw) == expected
 
 
 # ── CATEGORY_EMOJI coverage ───────────────────────────────────────────────────
