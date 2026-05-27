@@ -1643,7 +1643,8 @@ async def handle_chat(chat_id: int, text: str):
         "- 'Recently bookmarked links' are web links the user saved for later — they are NOT a travel history, "
         "NOT visit records, and their dates are bookmark dates, not visit dates. Never use them to answer itinerary questions.\n"
         "- If something isn't in the data, say so clearly. Do NOT invent or guess.\n"
-        "- Be concise. Plain text only, no markdown."
+        "- Be concise. Plain text only, no markdown.\n"
+        "- Never show your reasoning or thinking process. Just give the answer directly."
     )
 
     # Build message list with full conversation history for context
@@ -1763,4 +1764,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True}
+    return {"ok": True, "v": "9a9ec71"}
