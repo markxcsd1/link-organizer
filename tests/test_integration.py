@@ -17,6 +17,7 @@ from api.index import (
     notion_search,
     notion_query_db_rows,
     insert_into_trip_db,
+    notion_read_page_content,
     _map_type,
 )
 
@@ -279,3 +280,40 @@ class TestWebhookRouting:
         for nq in not_questions:
             is_q = bool(re.search(question_pattern, nq, re.IGNORECASE)) or nq.endswith("?")
             assert not is_q, nq
+
+
+# ── notion_read_page_content: table block rows ────────────────────────────────
+
+class TestNotionReadTableBlocks:
+    @respx.mock
+    async def test_table_rows_are_extracted(self):
+        """Tables in Notion are has_children blocks with table_row children.
+        The reader must fetch the children and emit one line per row — this is the
+        regression guard for the 'ferry price not found' class of bugs."""
+        page_id = "page-with-table"
+        table_id = "table-block-1"
+
+        # First call: page's blocks → returns ONE table block with has_children=true
+        respx.get(f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=50").mock(
+            return_value=httpx.Response(200, json={"results": [
+                {"id": table_id, "type": "table", "has_children": True, "table": {}},
+            ]})
+        )
+        # Second call: the table block's children → two table_row blocks
+        respx.get(f"https://api.notion.com/v1/blocks/{table_id}/children?page_size=50").mock(
+            return_value=httpx.Response(200, json={"results": [
+                {"type": "table_row", "table_row": {"cells": [
+                    [{"plain_text": "Leg"}], [{"plain_text": "Route"}], [{"plain_text": "Price"}],
+                ]}},
+                {"type": "table_row", "table_row": {"cells": [
+                    [{"plain_text": "2"}],
+                    [{"plain_text": "Kimolos → Sifnos"}],
+                    [{"plain_text": "€34.70"}],
+                ]}},
+            ]})
+        )
+
+        content = await notion_read_page_content(page_id, max_chars=4000)
+        assert "Kimolos → Sifnos" in content
+        assert "€34.70" in content
+        assert "Leg | Route | Price" in content
