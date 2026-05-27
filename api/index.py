@@ -1521,15 +1521,17 @@ async def handle_chat(chat_id: int, text: str):
                         context_lines.append(line)
                     pages_read += 1
             else:
-                content = await notion_read_page_content(page["id"], max_chars=1200)
+                content = await notion_read_page_content(page["id"], max_chars=2000)
                 if content and len(content) > 30:
                     context_lines.append(f"\nContent of '{page['title']}':\n{content}")
                     pages_read += 1
         except Exception:
             pass
 
-    # Also traverse parent pages — e.g. "Sifnos" page may live inside "Summer 2026"
+    # Traverse parent pages + their siblings
+    # e.g. "Amorgos" DB lives inside "Summer 2026" → read Summer 2026 content + all sibling pages (Rhodes, Italy…)
     seen_parents: set = set()
+    seen_children: set = set(p.get("id", "") for p in notion_results)
     for page in notion_results[:3]:
         if not page.get("id"):
             continue
@@ -1543,28 +1545,44 @@ async def handle_chat(chat_id: int, text: str):
                     parent_meta = await notion_fetch_page_meta(parent_id)
                     parent_title = parent_meta.get("title", "")
                     if parent_title:
-                        parent_content = await notion_read_page_content(parent_id, max_chars=2000)
+                        parent_content = await notion_read_page_content(parent_id, max_chars=3000)
                         if parent_content and len(parent_content) > 30:
                             context_lines.append(
                                 f"\nParent page '{parent_title}' (contains '{page['title']}'):\n{parent_content}"
                             )
+                        # Also read sibling pages (other children of the same parent)
+                        try:
+                            siblings = await notion_get_child_pages(parent_id)
+                            sib_added = 0
+                            for sib in siblings[:10]:
+                                sid = sib["id"]
+                                if sid in seen_children or sib_added >= 5:
+                                    continue
+                                seen_children.add(sid)
+                                sib_content = await notion_read_page_content(sid, max_chars=1200)
+                                if sib_content and len(sib_content) > 20:
+                                    context_lines.append(
+                                        f"\nSibling page '{sib['title']}' (inside '{parent_title}'):\n{sib_content}"
+                                    )
+                                    sib_added += 1
+                        except Exception:
+                            pass
         except Exception:
             pass
 
-    # Also traverse child pages — e.g. "Summer 2026" may have sub-pages like "Sifnos", "Kimolos"
-    seen_children: set = set(p.get("id", "") for p in notion_results)  # don't re-read already found pages
+    # Also traverse child pages of direct search results
     for page in notion_results[:2]:
         if not page.get("id"):
             continue
         try:
             children = await notion_get_child_pages(page["id"])
             added = 0
-            for child in children[:5]:
+            for child in children[:8]:
                 cid = child["id"]
-                if cid in seen_children or added >= 3:
+                if cid in seen_children or added >= 5:
                     continue
                 seen_children.add(cid)
-                child_content = await notion_read_page_content(cid, max_chars=500)
+                child_content = await notion_read_page_content(cid, max_chars=1200)
                 if child_content and len(child_content) > 20:
                     context_lines.append(
                         f"\nChild page '{child['title']}' (inside '{page['title']}'):\n{child_content}"
