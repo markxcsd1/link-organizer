@@ -218,7 +218,7 @@ async def fetch_page_meta(url: str) -> dict:
             m = re.search(pat, html, re.IGNORECASE)
             if m: desc = m.group(1).strip()[:400]; break
 
-    # 4. Google Maps — extract place name from final URL
+    # 4. Google Maps — extract place name from final URL; discard generic description
     maps_url = ""
     if re.search(r'(maps\.google\.|google\.[a-z.]+/maps|maps\.app\.goo\.gl)', url + " " + final_url, re.IGNORECASE):
         maps_url = final_url
@@ -230,8 +230,24 @@ async def fetch_page_meta(url: str) -> dict:
             qm = re.search(r'[?&]q=([^&#]+)', final_url)
             if qm:
                 place = unquote_plus(qm.group(1)).split(',')[0].strip()
-        if place and (not title or title.lower() in ("google maps", "maps")):
+        if place:
             title = place[:200]
+        desc = ""   # Google Maps' meta description is always useless
+
+    # 5. Universal fallback: if title is still just the platform name, try noembed.com
+    GENERIC = {"youtube", "google maps", "maps", "instagram", "facebook", "tiktok", "twitter", "x", ""}
+    if title.lower().strip() in GENERIC:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                ne = await client.get(f"https://noembed.com/embed?url={url}")
+            if ne.status_code == 200:
+                nd = ne.json()
+                if nd.get("title") and nd["title"].lower() not in GENERIC:
+                    title  = nd.get("title", title)[:200]
+                    author = nd.get("author_name", author)
+                    desc   = nd.get("description", desc) or desc
+        except Exception:
+            pass
 
     return {
         "title": title[:200] if title else "",
@@ -271,12 +287,13 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
     title = meta.get("title", "")
     desc  = meta.get("desc", "")
 
-    # If it looks like a place/restaurant/bar/hotel, do an extra web lookup
+    # Web lookup: always for Maps links; otherwise when content looks like a place
     web_info = ""
+    is_maps = bool(meta.get("maps_url"))
     place_hint = re.search(
         r'(restaurant|bar|cafe|hotel|beach|tavern|bistro|shop|museum|place|spot)',
-        title + " " + desc, re.IGNORECASE)
-    if place_hint or (note and re.search(r'(restaurant|bar|cafe|hotel|place)', note, re.IGNORECASE)):
+        title + " " + desc + " " + (note or ""), re.IGNORECASE)
+    if is_maps or place_hint:
         name_after_pin = re.search(r'📍\s*(\S[^,\n]{1,50})', title)
         candidate = name_after_pin.group(1).strip() if name_after_pin else title[:60]
         web_info = await web_lookup(candidate)
