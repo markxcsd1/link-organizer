@@ -1,12 +1,14 @@
 import os, json, secrets, httpx
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 
 app = FastAPI()
 
-GROQ_KEY   = os.environ["GROQ_API_KEY"]
-NOTION_KEY = os.environ["NOTION_API_KEY"]
-SECRET_KEY = os.environ["SECRET_KEY"]
+GROQ_KEY          = os.environ["GROQ_API_KEY"]
+NOTION_KEY        = os.environ["NOTION_API_KEY"]
+SECRET_KEY        = os.environ["SECRET_KEY"]
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_USER_ID  = os.environ.get("TELEGRAM_USER_ID", "")
 
 NOTION_DB = {
     "location": os.environ["NOTION_DB_LOCATION"],
@@ -210,6 +212,90 @@ async def get_logs(authorization: str = Header(...)):
             "name":           (p.get("Name", {}).get("title") or [{}])[0].get("text", {}).get("content", ""),
         })
     return {"ok": True, "logs": logs}
+
+
+async def tg_send(chat_id: int, text: str):
+    if not TELEGRAM_TOKEN:
+        return
+    async with httpx.AsyncClient(timeout=10) as client:
+        await client.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True},
+        )
+
+
+@app.post("/api/telegram")
+async def telegram_webhook(req: Request):
+    data = await req.json()
+
+    message = data.get("message", {})
+    chat_id = message.get("chat", {}).get("id")
+    user_id = str(message.get("from", {}).get("id", ""))
+    text    = message.get("text", "").strip()
+
+    # Security: ignore anyone who isn't you
+    if user_id != TELEGRAM_USER_ID:
+        return {"ok": True}
+
+    if not text:
+        return {"ok": True}
+
+    # Extract URL — first word that starts with http
+    parts = text.split()
+    url = next((p for p in parts if p.startswith("http")), None)
+
+    if not url:
+        await tg_send(chat_id, (
+            "Send me a link to save it\\. You can also add a note or force a category:\n\n"
+            "`https://example.com` — auto classify\n"
+            "`https://example.com !video` — force category\n"
+            "`https://example.com birthday gift` — add a note\n"
+            "`https://example.com !product birthday gift` — both"
+        ))
+        return {"ok": True}
+
+    # Everything except the URL is the note/command
+    note = text.replace(url, "").strip()
+    forced_category, clean_note = parse_command(note)
+
+    await tg_send(chat_id, "🔍 Classifying\\.\\.\\.")
+
+    ai_category = "unknown"
+    try:
+        result = await classify(url, clean_note)
+        ai_category = result.get("category", "other").lower()
+    except Exception as e:
+        await tg_send(chat_id, f"❌ Error classifying: {e}")
+        await save_log(url, note, forced_category, ai_category, "error", "", f"Groq error: {e}")
+        return {"ok": True}
+
+    category = forced_category or ai_category
+    if category not in NOTION_DB:
+        category = "other"
+
+    name       = result.get("name", "")[:200]
+    notes_text = result.get("notes", "")[:500]
+    if clean_note:
+        notes_text = (clean_note + (" — " + notes_text if notes_text else ""))[:500]
+
+    try:
+        notion_url = await save_to_notion(url, category, name, notes_text)
+    except Exception as e:
+        await tg_send(chat_id, f"❌ Error saving to Notion: {e}")
+        await save_log(url, note, forced_category, ai_category, category, name, f"Notion error: {e}")
+        return {"ok": True}
+
+    await save_log(url, note, forced_category, ai_category, category, name, "✓ success")
+
+    emoji = CATEGORY_EMOJI[category]
+    forced_note = f" _(category forced)_" if forced_category else ""
+    reply = f"{emoji} *Saved to {category.title()}s*{forced_note}\n*{name}*"
+    if notes_text:
+        reply += f"\n📝 {notes_text}"
+    reply += f"\n\n[Open in Notion]({notion_url})"
+
+    await tg_send(chat_id, reply)
+    return {"ok": True}
 
 
 @app.get("/api/health")
