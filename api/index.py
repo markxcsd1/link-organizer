@@ -22,7 +22,8 @@ NOTION_DB = {
     "other":    os.environ["NOTION_DB_OTHER"],
 }
 
-NOTION_DB_LOGS = os.environ.get("NOTION_DB_LOGS", "")
+NOTION_DB_LOGS        = os.environ.get("NOTION_DB_LOGS", "")
+NOTION_DB_TRIP_PLACES = os.environ.get("NOTION_DB_TRIP_PLACES", "")
 
 CATEGORY_EMOJI = {
     "location": "📍",
@@ -52,6 +53,7 @@ HELP_TEXT = """*Your personal knowledge assistant* 🧠
 Just send any URL — I'll analyse it and ask before saving\\.
 Add a note: `https://example\\.com great article`
 Force category: `https://example\\.com !video`
+After analysis, say *"save in my Sifnos list"* to add to a trip\\.
 
 *Search your knowledge:*
 `/search <query>` — search across all your Notion databases
@@ -59,6 +61,9 @@ Force category: `https://example\\.com !video`
 *Recent saves:*
 `/list` — show last 10 saves
 `/list articles` — filter by category
+
+*Trip places database:*
+`/setupdb` — create the Trip Places database in Notion \\(one\\-time setup\\)
 
 *Create a note:*
 `/note Meeting recap: we decided to\\.\\.\\.`
@@ -591,39 +596,32 @@ async def notion_get_child_pages(page_id: str) -> list:
     except Exception:
         return []
 
-async def notion_append_to_page(page_id: str, name: str, link_url: str, summary: str) -> str:
-    """Append a new entry to a Notion page, matching its existing format."""
-    # Read existing content to understand the page's structure
-    existing = await notion_read_page_content(page_id, max_chars=1000)
+async def notion_append_to_page(page_id: str, name: str, link_url: str, summary: str,
+                                type_: str = "", location: str = "", rating: str = "") -> str:
+    """Append a place entry to a Notion page using simple, reliable blocks."""
+    # Build name text with optional hyperlink
+    name_text: dict = {"content": name}
+    if link_url:
+        name_text["link"] = {"url": link_url}
 
-    # Ask Groq to generate blocks that match the page format
-    format_prompt = (
-        f"A Notion page has this existing content:\n{existing}\n\n"
-        f"Generate Notion API JSON blocks to append a new entry for:\n"
-        f"Name: {name}\nURL: {link_url}\nNotes: {summary}\n\n"
-        f"Match the existing format exactly (same block types, same style, same emoji conventions).\n"
-        f"Return ONLY a JSON array of Notion block objects, no markdown, no explanation."
-    )
-    blocks = None
-    try:
-        raw = await groq_chat([{"role": "user", "content": format_prompt}], max_tokens=500)
-        raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
-        raw = re.sub(r"```$", "", raw.strip())
-        # Extract JSON array
-        m = re.search(r'\[.*\]', raw, re.DOTALL)
-        if m:
-            blocks = json.loads(m.group(0))
-    except Exception:
-        pass
+    blocks = [{
+        "object": "block", "type": "bulleted_list_item",
+        "bulleted_list_item": {"rich_text": [{"type": "text", "text": name_text}]}
+    }]
 
-    # Fallback: simple bulleted item
-    if not blocks:
-        rich = [{"type": "text", "text": {"content": name,
-                 "link": {"url": link_url} if link_url else None}}]
-        if summary:
-            rich.append({"type": "text", "text": {"content": f" — {summary}"}})
-        blocks = [{"object": "block", "type": "bulleted_list_item",
-                   "bulleted_list_item": {"rich_text": rich}}]
+    # One detail line: type · location · rating — notes
+    detail_parts = [p for p in [type_, location] if p]
+    if rating:
+        detail_parts.append(f"⭐ {rating}")
+    detail = " · ".join(detail_parts)
+    if summary:
+        detail = (detail + " — " + summary) if detail else summary
+    if detail:
+        blocks.append({
+            "object": "block", "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": detail[:2000]},
+                                         "annotations": {"color": "gray"}}]}
+        })
 
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.patch(
@@ -633,6 +631,112 @@ async def notion_append_to_page(page_id: str, name: str, link_url: str, summary:
         )
     r.raise_for_status()
     return f"https://www.notion.so/{page_id.replace('-','')}"
+
+
+# ── Trip Places database ──────────────────────────────────────────────────────
+
+async def notion_create_trip_db() -> str:
+    """Create the Trip Places database at workspace root and return its ID."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            "https://api.notion.com/v1/databases",
+            headers=NOTION_HEADERS,
+            json={
+                "parent": {"type": "workspace", "workspace": True},
+                "title": [{"type": "text", "text": {"content": "🗺️ Trip Places"}}],
+                "properties": {
+                    "Name":     {"title": {}},
+                    "URL":      {"url": {}},
+                    "Maps":     {"url": {}},
+                    "Type":     {"select": {"options": [
+                        {"name": "Restaurant", "color": "orange"},
+                        {"name": "Bar",        "color": "purple"},
+                        {"name": "Cafe",       "color": "yellow"},
+                        {"name": "Beach",      "color": "blue"},
+                        {"name": "Hotel",      "color": "green"},
+                        {"name": "Village",    "color": "pink"},
+                        {"name": "Museum",     "color": "brown"},
+                        {"name": "Shop",       "color": "red"},
+                        {"name": "Other",      "color": "default"},
+                    ]}},
+                    "Location": {"rich_text": {}},
+                    "Rating":   {"rich_text": {}},
+                    "Notes":    {"rich_text": {}},
+                    "Trip":     {"select": {}},
+                },
+            },
+        )
+    r.raise_for_status()
+    return r.json()["id"]
+
+
+async def trip_places_add(pending: dict, trip_name: str) -> str:
+    """Add a place to the Trip Places database."""
+    if not NOTION_DB_TRIP_PLACES:
+        raise ValueError("NOTION_DB_TRIP_PLACES not configured — run /setupdb first")
+    name     = pending.get("name", "")
+    url      = pending.get("url", "") or "https://placeholder.com"
+    maps     = pending.get("maps_link", "") or "https://placeholder.com"
+    notes    = pending.get("notes", "")
+    type_    = pending.get("type_", "")
+    location = pending.get("location", "")
+    rating   = pending.get("rating", "")
+
+    props: dict = {
+        "Name":  {"title": [{"text": {"content": name[:200]}}]},
+        "URL":   {"url": url},
+        "Trip":  {"select": {"name": trip_name[:100]}},
+    }
+    if maps and maps != "https://placeholder.com":
+        props["Maps"] = {"url": maps}
+    if type_:
+        props["Type"] = {"select": {"name": type_[:100]}}
+    if location:
+        props["Location"] = {"rich_text": _rich_text(location)}
+    if rating:
+        props["Rating"] = {"rich_text": _rich_text(rating)}
+    if notes:
+        props["Notes"] = {"rich_text": _rich_text(notes)}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            "https://api.notion.com/v1/pages",
+            headers=NOTION_HEADERS,
+            json={"parent": {"database_id": NOTION_DB_TRIP_PLACES}, "properties": props},
+        )
+    r.raise_for_status()
+    return r.json()["url"]
+
+
+async def trip_places_query(trip: str) -> list:
+    """Query Trip Places database filtered by trip name."""
+    if not NOTION_DB_TRIP_PLACES:
+        return []
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            f"https://api.notion.com/v1/databases/{NOTION_DB_TRIP_PLACES}/query",
+            headers=NOTION_HEADERS,
+            json={
+                "filter": {"property": "Trip", "select": {"equals": trip}},
+                "sorts": [{"property": "Name", "direction": "ascending"}],
+                "page_size": 20,
+            },
+        )
+    if r.status_code != 200:
+        return []
+    results = []
+    for page in r.json().get("results", []):
+        props = page.get("properties", {})
+        name  = (props.get("Name", {}).get("title") or [{}])[0].get("plain_text", "Untitled")
+        type_ = props.get("Type", {}).get("select", {})
+        type_name = type_.get("name", "") if type_ else ""
+        loc_rt = props.get("Location", {}).get("rich_text", [])
+        location = loc_rt[0].get("plain_text", "") if loc_rt else ""
+        rat_rt = props.get("Rating", {}).get("rich_text", [])
+        rating = rat_rt[0].get("plain_text", "") if rat_rt else ""
+        results.append({"name": name, "type": type_name, "location": location,
+                        "rating": rating, "notion_url": page.get("url", "")})
+    return results
 
 async def notion_create_standalone_page(title: str, content: str) -> str:
     async with httpx.AsyncClient(timeout=15) as client:
@@ -794,6 +898,8 @@ async def handle_save_link(chat_id: int, url: str, note: str):
     rating    = _clean_field(result.get("rating", ""))
     maps_link = meta.get("maps_url") or result.get("maps_link", "")
     summary   = result.get("summary", "")[:600]
+    # Strip "unspecified" language from summaries too
+    summary   = re.sub(r'\b(at an? )?unspecified (location|place|address)\b[,.]?', '', summary, flags=re.IGNORECASE).strip()
     if clean_note:
         summary = clean_note + (" — " + summary if summary else "")
 
@@ -812,6 +918,10 @@ async def handle_save_link(chat_id: int, url: str, note: str):
         "ai_category":   ai_category,
         "related_pages": related_pages,
         "maps_link":     maps_link,
+        # Extra fields for trip DB
+        "type_":         type_,
+        "location":      location,
+        "rating":        rating,
     }
 
     emoji = CATEGORY_EMOJI.get(category, "📌")
@@ -964,8 +1074,12 @@ async def handle_callback_query(cq: dict):
         await tg_edit_buttons(chat_id, message_id,
                               cq["message"]["text"] + f"\n\n_Adding to \"{page_title}\"…_")
         try:
-            notion_url = await notion_append_to_page(
-                page_id, pending["name"], pending["url"], pending["notes"])
+            if NOTION_DB_TRIP_PLACES:
+                notion_url = await trip_places_add(pending, page_title)
+            else:
+                notion_url = await notion_append_to_page(
+                    page_id, pending["name"], pending["url"], pending["notes"],
+                    pending.get("type_", ""), pending.get("location", ""), pending.get("rating", ""))
             await save_log(pending["url"], pending["notes"], pending["forced"],
                            pending["ai_category"], pending["category"], pending["name"], "✓ success")
             await tg_edit_buttons(chat_id, message_id,
@@ -1057,27 +1171,34 @@ async def handle_pending_modification(chat_id: int, text: str, pid: str, pending
     if action == "addto":
         page_query = result.get("page", "").strip()
         if not page_query:
-            # Fall through to normal save
-            action = "save"
+            action = "save"  # fall through
         else:
-            pages = await notion_search(page_query)
-            # Pick best match: prefer exact title match, else first result
-            target = next((p for p in pages if page_query.lower() in p["title"].lower()), None)
-            target = target or (pages[0] if pages else None)
-            if not target:
-                await tg_send(chat_id, f"❌ Couldn't find a Notion page called \"{page_query}\".")
-                return
             pending_item = PENDING.pop(pid, None)
             if not pending_item:
                 return
-            await tg_send(chat_id, f"➕ Adding to \"{target['title']}\"…")
+            await tg_send(chat_id, f"➕ Adding to \"{page_query}\"…")
             try:
-                notion_url = await notion_append_to_page(
-                    target["id"], pending_item["name"], pending_item["url"], pending_item["notes"])
-                await save_log(pending_item["url"], pending_item["notes"], pending_item["forced"],
-                               pending_item["ai_category"], pending_item["category"], pending_item["name"], "✓ success (addto)")
+                if NOTION_DB_TRIP_PLACES:
+                    # Use the Trip Places database — cleaner and more reliable
+                    notion_url = await trip_places_add(pending_item, page_query)
+                    label = page_query
+                else:
+                    # Fall back to page append
+                    pages = await notion_search(page_query)
+                    target = next((p for p in pages if page_query.lower() in p["title"].lower()), None)
+                    target = target or (pages[0] if pages else None)
+                    if not target:
+                        await tg_send(chat_id, f"❌ Couldn't find a Notion page called \"{page_query}\".")
+                        return
+                    notion_url = await notion_append_to_page(
+                        target["id"], pending_item["name"], pending_item["url"], pending_item["notes"],
+                        pending_item.get("type_", ""), pending_item.get("location", ""), pending_item.get("rating", ""))
+                    label = target["title"]
+                await save_log(pending_item["url"], pending_item["notes"], pending_item.get("forced"),
+                               pending_item.get("ai_category", ""), pending_item.get("category", ""),
+                               pending_item["name"], "✓ success (addto)")
                 await tg_send(chat_id,
-                    f"✅ *Added to \"{target['title']}\"*\n\n*{pending_item['name']}*\n\n[Open in Notion]({notion_url})")
+                    f"✅ *Added to \"{label}\"*\n\n*{pending_item['name']}*\n\n[Open in Notion]({notion_url})")
             except Exception as e:
                 await tg_send(chat_id, f"❌ Failed: {e}")
             return
@@ -1164,6 +1285,31 @@ async def handle_list(chat_id: int, category: str | None = None):
         emoji = CATEGORY_EMOJI.get(p["category"], "📌")
         lines.append(f"{emoji} [{p['title']}]({p['notion_url']}) — _{p['time']}_")
     await tg_send(chat_id, "\n".join(lines))
+
+
+async def handle_setupdb(chat_id: int):
+    """Create the Trip Places database in Notion and return its ID."""
+    if NOTION_DB_TRIP_PLACES:
+        await tg_send(chat_id,
+            f"✅ Trip Places database is already configured\\.\n\n"
+            f"Database ID: `{NOTION_DB_TRIP_PLACES}`")
+        return
+    await tg_send(chat_id, "⚙️ Creating Trip Places database in Notion…")
+    try:
+        db_id = await notion_create_trip_db()
+        msg = (
+            f"✅ *Trip Places database created\\!*\n\n"
+            f"Database ID:\n`{db_id}`\n\n"
+            f"*Next steps:*\n"
+            f"1\\. Go to Vercel → your project → Settings → Environment Variables\n"
+            f"2\\. Add: `NOTION_DB_TRIP_PLACES` = `{db_id}`\n"
+            f"3\\. Redeploy \\(or push any commit\\)\n\n"
+            f"After that, saying *\"save in my Sifnos list\"* will add a row to this "
+            f"database tagged with Trip=Sifnos instead of appending to a page\\."
+        )
+        await tg_send(chat_id, msg)
+    except Exception as e:
+        await tg_send(chat_id, f"❌ Failed to create database: {e}")
 
 
 async def handle_create_note(chat_id: int, content: str):
@@ -1287,6 +1433,25 @@ async def handle_chat(chat_id: int, text: str):
         except Exception:
             pass
 
+    # Also query Trip Places database for relevant trip entries
+    if NOTION_DB_TRIP_PLACES:
+        try:
+            # Extract a trip name from the search query (any word that looks like a place)
+            for word in search_query.split():
+                if len(word) > 3:
+                    trip_places = await trip_places_query(word.strip(",.?!"))
+                    if trip_places:
+                        context_lines.append(f"\nTrip Places for '{word}':")
+                        for tp in trip_places:
+                            line = f"- {tp['name']}"
+                            if tp.get("type"):     line += f" ({tp['type']})"
+                            if tp.get("location"): line += f" — {tp['location']}"
+                            if tp.get("rating"):   line += f" ⭐ {tp['rating']}"
+                            context_lines.append(line)
+                        break
+        except Exception:
+            pass
+
     # Also pull recent saves for general context
     try:
         recent = await notion_list_recent(limit=6)
@@ -1346,6 +1511,9 @@ async def telegram_webhook(req: Request):
 
     if text in ("/start", "/help"):
         await tg_send(chat_id, HELP_TEXT)
+
+    elif text == "/setupdb":
+        await handle_setupdb(chat_id)
 
     elif text.startswith("/search "):
         await handle_search(chat_id, text[8:].strip())
