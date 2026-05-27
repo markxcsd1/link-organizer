@@ -530,6 +530,26 @@ async def notion_read_page_content(page_id: str, max_chars: int = 3000) -> str:
     except Exception:
         return ""
 
+async def notion_get_child_pages(page_id: str) -> list:
+    """Return list of {id, title} for direct child pages (sub-pages) inside a Notion page."""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=50",
+                headers=NOTION_HEADERS)
+        if r.status_code != 200:
+            return []
+        children = []
+        for block in r.json().get("results", []):
+            if block.get("type") == "child_page":
+                children.append({
+                    "id": block["id"],
+                    "title": block.get("child_page", {}).get("title", "Untitled"),
+                })
+        return children
+    except Exception:
+        return []
+
 async def notion_append_to_page(page_id: str, name: str, link_url: str, summary: str) -> str:
     """Append a new entry to a Notion page, matching its existing format."""
     # Read existing content to understand the page's structure
@@ -1172,6 +1192,28 @@ async def handle_chat(chat_id: int, text: str):
                             context_lines.append(
                                 f"\nParent page '{parent_title}' (contains '{page['title']}'):\n{parent_content}"
                             )
+        except Exception:
+            pass
+
+    # Also traverse child pages — e.g. "Summer 2026" may have sub-pages like "Sifnos", "Kimolos"
+    seen_children: set = set(p.get("id", "") for p in notion_results)  # don't re-read already found pages
+    for page in notion_results[:2]:
+        if not page.get("id"):
+            continue
+        try:
+            children = await notion_get_child_pages(page["id"])
+            added = 0
+            for child in children[:5]:
+                cid = child["id"]
+                if cid in seen_children or added >= 3:
+                    continue
+                seen_children.add(cid)
+                child_content = await notion_read_page_content(cid, max_chars=500)
+                if child_content and len(child_content) > 20:
+                    context_lines.append(
+                        f"\nChild page '{child['title']}' (inside '{page['title']}'):\n{child_content}"
+                    )
+                    added += 1
         except Exception:
             pass
 
