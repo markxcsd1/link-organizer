@@ -1575,9 +1575,9 @@ async def handle_chat(chat_id: int, text: str):
     try:
         recent = await notion_list_recent(limit=6)
         if recent:
-            context_lines.append("\nRecently saved items:")
+            context_lines.append("\nRecently bookmarked links (saved dates are when the link was bookmarked, NOT when the user visited):")
             for p in recent:
-                context_lines.append(f"- [{p['category']}] {p['title']} — {p['time']}")
+                context_lines.append(f"- [{p['category']}] {p['title']} — bookmarked {p['time']}")
     except Exception:
         pass
 
@@ -1588,9 +1588,11 @@ async def handle_chat(chat_id: int, text: str):
         f"NOTION DATA:\n{knowledge_context}\n\n"
         "Rules:\n"
         "- Answer using the Notion data above. Be specific, reference actual items.\n"
-        "- For follow-up questions (e.g. 'And then?', 'What's next?', 'After that?'), "
-        "use the conversation history to understand what the user is asking about.\n"
-        "- If something isn't in the data, say so and suggest /search <keyword>.\n"
+        "- For follow-up questions (e.g. 'And then?', 'What about after that?', 'And after?'), "
+        "use the conversation history to understand the topic — stay focused on that topic (e.g. trip itinerary).\n"
+        "- 'Recently bookmarked links' are web links the user saved for later — they are NOT a travel history, "
+        "NOT visit records, and their dates are bookmark dates, not visit dates. Never use them to answer itinerary questions.\n"
+        "- If something isn't in the data, say so clearly. Do NOT invent or guess.\n"
         "- Be concise. Plain text only, no markdown."
     )
 
