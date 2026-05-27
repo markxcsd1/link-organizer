@@ -9,6 +9,8 @@ NOTION_KEY       = os.environ["NOTION_API_KEY"]
 SECRET_KEY       = os.environ["SECRET_KEY"]
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_USER_ID = os.environ.get("TELEGRAM_USER_ID", "")
+GITHUB_TOKEN     = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO      = os.environ.get("GITHUB_REPO", "markxcsd1/obsidian-vault")
 
 NOTION_DB = {
     "location": os.environ["NOTION_DB_LOCATION"],
@@ -131,17 +133,26 @@ async def notion_search(query: str) -> list:
         r = await client.post(
             "https://api.notion.com/v1/search",
             headers=NOTION_HEADERS,
-            json={"query": query, "page_size": 8,
-                  "filter": {"value": "page", "property": "object"}},
+            json={"query": query, "page_size": 10},
         )
     r.raise_for_status()
     results = []
-    for page in r.json().get("results", []):
-        props = page.get("properties", {})
-        title_items = props.get("Name", {}).get("title", [])
-        title = title_items[0]["text"]["content"] if title_items else "Untitled"
-        url = props.get("URL", {}).get("url", "")
-        results.append({"title": title, "url": url, "notion_url": page["url"]})
+    for obj in r.json().get("results", []):
+        props = obj.get("properties", {})
+        # Title can be in any property with type "title" (varies by page/db)
+        title = "Untitled"
+        url = ""
+        for val in props.values():
+            if val.get("type") == "title":
+                items = val.get("title", [])
+                if items:
+                    title = items[0].get("plain_text") or items[0].get("text", {}).get("content", "Untitled")
+                    break
+        for val in props.values():
+            if val.get("type") == "url":
+                url = val.get("url") or ""
+                break
+        results.append({"title": title, "url": url, "notion_url": obj.get("url", "")})
     return results
 
 async def notion_list_recent(category: str | None = None, limit: int = 10) -> list:
@@ -158,9 +169,18 @@ async def notion_list_recent(category: str | None = None, limit: int = 10) -> li
             if r.status_code == 200:
                 for page in r.json().get("results", []):
                     props = page.get("properties", {})
-                    title_items = props.get("Name", {}).get("title", [])
-                    title = title_items[0]["text"]["content"] if title_items else "Untitled"
-                    url = props.get("URL", {}).get("url", "")
+                    title = "Untitled"
+                    url = ""
+                    for val in props.values():
+                        if val.get("type") == "title":
+                            items = val.get("title", [])
+                            if items:
+                                title = items[0].get("plain_text") or items[0].get("text", {}).get("content", "Untitled")
+                                break
+                    for val in props.values():
+                        if val.get("type") == "url":
+                            url = val.get("url") or ""
+                            break
                     # find which category this db belongs to
                     cat = next((k for k, v in NOTION_DB.items() if v == db_id), "other")
                     pages.append({
@@ -193,6 +213,67 @@ async def save_log(url: str, note: str, forced: str | None, ai_category: str,
                                     "properties": properties})
     except Exception:
         pass
+
+
+# ── GitHub / Obsidian operations ─────────────────────────────────────────────
+
+def _gh_headers():
+    return {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+
+def _sanitize(name: str) -> str:
+    return re.sub(r'[\\/*?:"<>|]', "", name).strip()[:100] or "Untitled"
+
+async def obsidian_create_note(title: str, content: str, folder: str = "Notes") -> str:
+    """Commit a new .md file to the Obsidian GitHub repo."""
+    import base64
+    filename = f"{folder}/{_sanitize(title)}.md"
+    body = f"# {title}\n\n{content}\n"
+    encoded = base64.b64encode(body.encode()).decode()
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.put(
+            f"https://api.github.com/repos/{GITHUB_REPO}/contents/{filename}",
+            headers=_gh_headers(),
+            json={"message": f"Add note: {title}", "content": encoded},
+        )
+    r.raise_for_status()
+    return f"https://github.com/{GITHUB_REPO}/blob/main/{filename}"
+
+async def obsidian_search(query: str) -> list:
+    """Search file names and content in the Obsidian GitHub repo."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"https://api.github.com/search/code?q={query}+repo:{GITHUB_REPO}",
+            headers=_gh_headers(),
+        )
+    if r.status_code != 200:
+        return []
+    results = []
+    for item in r.json().get("items", [])[:6]:
+        results.append({
+            "title": item["name"].replace(".md", ""),
+            "path": item["path"],
+            "url": item["html_url"],
+        })
+    return results
+
+async def obsidian_list_recent(limit: int = 8) -> list:
+    """List recently committed files in the Obsidian repo."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(
+            f"https://api.github.com/repos/{GITHUB_REPO}/commits?per_page={limit}",
+            headers=_gh_headers(),
+        )
+    if r.status_code != 200:
+        return []
+    results = []
+    seen = set()
+    for commit in r.json():
+        msg = commit["commit"]["message"]
+        url = commit["html_url"]
+        if msg not in seen:
+            seen.add(msg)
+            results.append({"title": msg, "url": url})
+    return results
 
 
 # ── Bot handlers ──────────────────────────────────────────────────────────────
@@ -241,21 +322,38 @@ async def handle_save_link(chat_id: int, url: str, note: str):
 
 async def handle_search(chat_id: int, query: str):
     await tg_send(chat_id, f"🔍 Searching for *{query}*…")
+    lines = [f"*Results for \"{query}\":*\n"]
+    found = False
+
+    # Search Notion
     try:
-        results = await notion_search(query)
+        notion_results = await notion_search(query)
+        if notion_results:
+            found = True
+            lines.append("*Notion:*")
+            for r in notion_results:
+                line = f"📋 [{r['title']}]({r['notion_url']})"
+                if r.get("url"):
+                    line += f" — [source]({r['url']})"
+                lines.append(line)
     except Exception as e:
-        await tg_send(chat_id, f"❌ Search failed: {e}")
-        return
-    if not results:
+        lines.append(f"Notion search failed: {e}")
+
+    # Search Obsidian via GitHub
+    if GITHUB_TOKEN:
+        try:
+            obsidian_results = await obsidian_search(query)
+            if obsidian_results:
+                found = True
+                lines.append("\n*Obsidian:*")
+                for r in obsidian_results:
+                    lines.append(f"📝 [{r['title']}]({r['url']})")
+        except Exception:
+            pass
+
+    if not found:
         await tg_send(chat_id, f"No results found for *{query}*\\.")
         return
-    lines = [f"*Results for \"{query}\":*\n"]
-    for r in results:
-        emoji = "🔗"
-        line = f"{emoji} [{r['title']}]({r['notion_url']})"
-        if r.get("url"):
-            line += f" — [source]({r['url']})"
-        lines.append(line)
     await tg_send(chat_id, "\n".join(lines))
 
 
@@ -286,19 +384,28 @@ async def handle_create_note(chat_id: int, content: str):
         title = content[:60].rstrip()
         body = content
 
+    results = []
+
+    # Save to Notion
     try:
         notion_url = await notion_save_page(NOTION_DB["other"], {
             "Name":  {"title": [{"text": {"content": title}}]},
             "URL":   {"url": "https://placeholder.com"},
             "Notes": {"rich_text": _rich_text(body)},
         })
+        results.append(f"[Notion]({notion_url})")
     except Exception as e:
-        await tg_send(chat_id, f"❌ Failed to save note: {e}")
-        return
+        results.append(f"Notion ❌ {e}")
 
-    await tg_send(chat_id,
-        f"📝 *Note saved*\n*{title}*\n\n[Open in Notion]({notion_url})\n\n"
-        f"_Run `sync\\_obsidian.py` to sync to Obsidian_")
+    # Save to Obsidian via GitHub
+    if GITHUB_TOKEN:
+        try:
+            gh_url = await obsidian_create_note(title, body)
+            results.append(f"[Obsidian/GitHub]({gh_url})")
+        except Exception as e:
+            results.append(f"Obsidian ❌ {e}")
+
+    await tg_send(chat_id, f"📝 *Note saved*\n*{title}*\n\n" + " · ".join(results))
 
 
 async def handle_chat(chat_id: int, text: str):
