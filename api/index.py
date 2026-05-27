@@ -370,7 +370,11 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
             if loc_match:
                 location_hint = loc_match.group(1).strip()[:60]
 
-        search_q = f"{candidate} {location_hint}".strip()
+        # Build a richer search query: include type keywords from title too
+        type_words = " ".join(re.findall(
+            r'(restaurant|bar|cafe|hotel|beach bar|tavern|bistro|shop|museum)',
+            title + " " + desc, re.IGNORECASE))
+        search_q = " ".join(filter(None, [candidate, type_words[:30], location_hint])).strip()
         web_info = await web_search(search_q)
 
         # Pre-extract any rating found in the snippets so Groq doesn't miss it
@@ -472,17 +476,78 @@ async def notion_find_related(search_terms: list) -> list:
             pass
     return related[:4]
 
+async def notion_read_page_content(page_id: str, max_chars: int = 3000) -> str:
+    """Read the text content of a Notion page (its blocks)."""
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=50",
+                headers=NOTION_HEADERS)
+        if r.status_code != 200:
+            return ""
+        lines = []
+        for block in r.json().get("results", []):
+            btype = block.get("type", "")
+            bdata = block.get(btype, {})
+            rt = bdata.get("rich_text", [])
+            text = "".join(t.get("plain_text", "") for t in rt)
+            if not text:
+                continue
+            if btype in ("heading_1", "heading_2", "heading_3"):
+                lines.append(f"{'#' * int(btype[-1])} {text}")
+            elif btype in ("bulleted_list_item",):
+                lines.append(f"• {text}")
+            elif btype == "numbered_list_item":
+                lines.append(f"- {text}")
+            elif btype == "to_do":
+                lines.append(f"{'✓' if bdata.get('checked') else '○'} {text}")
+            elif btype == "callout":
+                lines.append(f"📌 {text}")
+            else:
+                lines.append(text)
+        return "\n".join(lines)[:max_chars]
+    except Exception:
+        return ""
+
 async def notion_append_to_page(page_id: str, name: str, link_url: str, summary: str) -> str:
-    rich = [{"type": "text", "text": {"content": name,
-             "link": {"url": link_url} if link_url else None}}]
-    if summary:
-        rich.append({"type": "text", "text": {"content": f" — {summary}"}})
+    """Append a new entry to a Notion page, matching its existing format."""
+    # Read existing content to understand the page's structure
+    existing = await notion_read_page_content(page_id, max_chars=1000)
+
+    # Ask Groq to generate blocks that match the page format
+    format_prompt = (
+        f"A Notion page has this existing content:\n{existing}\n\n"
+        f"Generate Notion API JSON blocks to append a new entry for:\n"
+        f"Name: {name}\nURL: {link_url}\nNotes: {summary}\n\n"
+        f"Match the existing format exactly (same block types, same style, same emoji conventions).\n"
+        f"Return ONLY a JSON array of Notion block objects, no markdown, no explanation."
+    )
+    blocks = None
+    try:
+        raw = await groq_chat([{"role": "user", "content": format_prompt}], max_tokens=500)
+        raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
+        raw = re.sub(r"```$", "", raw.strip())
+        # Extract JSON array
+        m = re.search(r'\[.*\]', raw, re.DOTALL)
+        if m:
+            blocks = json.loads(m.group(0))
+    except Exception:
+        pass
+
+    # Fallback: simple bulleted item
+    if not blocks:
+        rich = [{"type": "text", "text": {"content": name,
+                 "link": {"url": link_url} if link_url else None}}]
+        if summary:
+            rich.append({"type": "text", "text": {"content": f" — {summary}"}})
+        blocks = [{"object": "block", "type": "bulleted_list_item",
+                   "bulleted_list_item": {"rich_text": rich}}]
+
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.patch(
             f"https://api.notion.com/v1/blocks/{page_id}/children",
             headers=NOTION_HEADERS,
-            json={"children": [{"object":"block","type":"bulleted_list_item",
-                                "bulleted_list_item":{"rich_text": rich}}]},
+            json={"children": blocks},
         )
     r.raise_for_status()
     return f"https://www.notion.so/{page_id.replace('-','')}"
@@ -1040,11 +1105,12 @@ async def handle_chat(chat_id: int, text: str):
 
     # Search Notion with extracted keywords
     context_lines = []
+    notion_results = []
     try:
         notion_results = await notion_search(search_query)
         if notion_results:
-            context_lines.append("Relevant items from the user's Notion:")
-            for r in notion_results[:8]:
+            context_lines.append("Relevant Notion pages found:")
+            for r in notion_results[:6]:
                 line = f"- {r['title']}"
                 if r.get("url"):
                     line += f" ({r['url']})"
@@ -1052,11 +1118,24 @@ async def handle_chat(chat_id: int, text: str):
     except Exception:
         pass
 
+    # Read the CONTENT of the top 3 most relevant pages
+    # This allows answering questions like "how much is the ferry?" or "what did I save for Sifnos?"
+    pages_read = 0
+    for page in notion_results[:3]:
+        if page.get("id") and pages_read < 3:
+            try:
+                content = await notion_read_page_content(page["id"], max_chars=1200)
+                if content and len(content) > 30:
+                    context_lines.append(f"\nContent of '{page['title']}':\n{content}")
+                    pages_read += 1
+            except Exception:
+                pass
+
     # Also pull recent saves for general context
     try:
-        recent = await notion_list_recent(limit=8)
+        recent = await notion_list_recent(limit=6)
         if recent:
-            context_lines.append("\nRecently saved:")
+            context_lines.append("\nRecently saved items:")
             for p in recent:
                 context_lines.append(f"- [{p['category']}] {p['title']} — {p['time']}")
     except Exception:
