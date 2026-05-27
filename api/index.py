@@ -409,14 +409,38 @@ async def handle_create_note(chat_id: int, content: str):
 
 
 async def handle_chat(chat_id: int, text: str):
+    # Always search Notion first so the AI has real data to answer from
+    context_lines = []
+    try:
+        notion_results = await notion_search(text)
+        if notion_results:
+            context_lines.append("Relevant items from the user's Notion knowledge base:")
+            for r in notion_results[:6]:
+                line = f"- {r['title']}"
+                if r.get("url"):
+                    line += f" ({r['url']})"
+                context_lines.append(line)
+    except Exception:
+        pass
+
+    # Also pull recent saves for general context
+    try:
+        recent = await notion_list_recent(limit=5)
+        if recent:
+            context_lines.append("\nRecently saved:")
+            for p in recent:
+                context_lines.append(f"- [{p['category']}] {p['title']} — {p['time']}")
+    except Exception:
+        pass
+
+    knowledge_context = "\n".join(context_lines) if context_lines else "No items found in knowledge base yet."
+
     system = (
-        "You are a personal knowledge assistant. The user has a personal knowledge base with:\n"
-        "- Notion databases: locations, products, articles, videos, recipes, and other/notes\n"
-        "- Obsidian vault synced from Notion articles (synced manually)\n\n"
-        "You help them save, find, and think about their saved content. "
-        "Be concise and helpful. If they ask about their saved content you can't directly access "
-        "right now, suggest they use /search or /list to find it. "
-        "Keep responses under 200 words. Use plain text, no markdown."
+        "You are a personal knowledge assistant with direct access to the user's Notion knowledge base.\n\n"
+        f"{knowledge_context}\n\n"
+        "Answer the user's question using the above data. Be specific and reference actual items when relevant. "
+        "If the user asks to find something not in the results above, tell them to try /search <query> for a more targeted search. "
+        "Keep responses concise. Use plain text, no markdown formatting."
     )
     try:
         response = await groq_chat([
