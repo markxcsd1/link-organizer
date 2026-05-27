@@ -263,9 +263,9 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
         f"4. Generate a maps_link: Google Maps search URL for the place (if it's a location).\n\n"
         f"Categories: location, product, article, video, recipe, other\n\n"
         f"Return ONLY valid JSON, no markdown:\n"
-        f'{{"category":"...","name":"exact subject name","location":"city/country if known","summary":"3-4 sentences — what it is, vibe/style, any rating or review highlights","maps_link":"https://www.google.com/maps/search/Name+City or empty","search_terms":["term1","term2"]}}'
+        f'{{"category":"...","name":"exact venue/dish/product name","location":"neighbourhood, city, country","type":"e.g. Beach bar, Sushi restaurant, Boutique hotel","vibe":"2-3 adjectives, e.g. laid-back, scenic, upscale","best_for":"what kind of visit/person, e.g. sunset drinks, solo travelers","summary":"3-5 sentences describing the place — what makes it special, atmosphere, must-tries, any review/rating highlights from the available info","rating":"score if found, else empty","maps_link":"https://www.google.com/maps/search/Name+City (URL-encode spaces as +)","search_terms":["term1","term2"]}}'
     )
-    raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=500)
+    raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=700)
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
     raw = re.sub(r"```$", "", raw.strip())
     m = re.search(r"\{.*\}", raw, re.DOTALL)
@@ -497,8 +497,12 @@ async def handle_save_link(chat_id: int, url: str, note: str):
 
     name      = result.get("name", meta.get("title", ""))[:200] or url
     location  = result.get("location", "")
+    type_     = result.get("type", "")
+    vibe      = result.get("vibe", "")
+    best_for  = result.get("best_for", "")
+    rating    = result.get("rating", "")
     maps_link = result.get("maps_link", "")
-    summary   = result.get("summary", "")[:500]
+    summary   = result.get("summary", "")[:600]
     if clean_note:
         summary = clean_note + (" — " + summary if summary else "")
 
@@ -522,12 +526,27 @@ async def handle_save_link(chat_id: int, url: str, note: str):
     }
 
     emoji = CATEGORY_EMOJI.get(category, "📌")
-    text = f"🔍 *Analysis*\n\n*{name}*"
+
+    # Build rich analysis card
+    lines = [f"🔍 *{name}*"]
     if location:
-        text += f"\n📍 {location}"
-    text += f"\n{emoji} Suggested: *{category.title()}*\n\n{summary}"
+        lines.append(f"📍 {location}")
+    meta_parts = []
+    if type_:    meta_parts.append(type_)
+    if vibe:     meta_parts.append(vibe)
+    if rating:   meta_parts.append(f"⭐ {rating}")
+    if meta_parts:
+        lines.append("  ".join(meta_parts))
+    lines.append("")
+    if summary:
+        lines.append(summary)
+    if best_for:
+        lines.append(f"\n✅ *Best for:* {best_for}")
     if maps_link:
-        text += f"\n\n[📌 Open in Google Maps]({maps_link})"
+        lines.append(f"\n[📌 View on Google Maps]({maps_link})")
+    lines.append(f"\n{emoji} Suggested category: *{category.title()}*")
+
+    text = "\n".join(lines)
 
     # Build smart button rows
     keyboard = []
