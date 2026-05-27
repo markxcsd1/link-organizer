@@ -350,17 +350,28 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
     if is_maps or place_hint:
         name_after_pin = re.search(r'📍\s*(\S[^,\n]{1,50})', title)
         candidate = name_after_pin.group(1).strip() if name_after_pin else title[:60]
-        # Extract location from Maps URL query for a better search
+
+        # Build a rich search query with location context
         location_hint = ""
         maps_url = meta.get("maps_url", "")
         if maps_url:
+            # For Maps links: pull location from URL query string
             qm = re.search(r'[?&]q=([^&#]+)', maps_url)
             if qm:
                 full_q = unquote_plus(qm.group(1))
-                # Take everything after first comma as location context
                 parts_q = full_q.split(',')
                 location_hint = ", ".join(parts_q[1:3]).strip() if len(parts_q) > 1 else ""
-        web_info = await web_search(f"{candidate} {location_hint}".strip())
+        else:
+            # For other links (YouTube etc): extract location words from title/desc
+            # Look for place names after the venue name
+            loc_match = re.search(
+                r'(?:in|at|,)\s+([A-Z][a-zA-Zα-ωΑ-Ω\s]{2,30}(?:,\s*[A-Z][a-zA-Zα-ωΑ-Ω\s]{2,20})?)',
+                title + " " + desc)
+            if loc_match:
+                location_hint = loc_match.group(1).strip()[:60]
+
+        search_q = f"{candidate} {location_hint}".strip()
+        web_info = await web_search(search_q)
 
     meta_text = ""
     if title:
