@@ -134,15 +134,46 @@ async def groq_chat(messages: list, max_tokens: int = 512) -> str:
     return r.json()["choices"][0]["message"]["content"].strip()
 
 async def fetch_page_meta(url: str) -> dict:
-    """Fetch real page title + description from HTML meta tags."""
+    """Fetch real page title + description. Uses oEmbed for YouTube/Vimeo."""
+    # YouTube and YouTube Shorts — use oEmbed (free, no API key, returns real title)
+    if re.search(r'(youtube\.com|youtu\.be)', url, re.IGNORECASE):
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(
+                    f"https://www.youtube.com/oembed?url={url}&format=json")
+            if r.status_code == 200:
+                data = r.json()
+                return {
+                    "title": data.get("title", "")[:200],
+                    "desc":  f"YouTube video by {data.get('author_name', '')}",
+                }
+        except Exception:
+            pass
+
+    # Vimeo oEmbed
+    if "vimeo.com" in url:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                r = await client.get(
+                    f"https://vimeo.com/api/oembed.json?url={url}")
+            if r.status_code == 200:
+                data = r.json()
+                return {
+                    "title": data.get("title", "")[:200],
+                    "desc":  data.get("description", "")[:400],
+                }
+        except Exception:
+            pass
+
+    # Generic: scrape HTML meta tags
     try:
         async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
             r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
         html = r.text
-        og_title   = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        og_title    = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
         plain_title = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
-        og_desc    = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
-        meta_desc  = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        og_desc     = re.search(r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        meta_desc   = re.search(r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']', html, re.IGNORECASE)
         title = (og_title or plain_title)
         desc  = (og_desc or meta_desc)
         return {
