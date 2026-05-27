@@ -250,16 +250,25 @@ async def fetch_page_meta(url: str) -> dict:
 
     # 4. Google Maps — extract place name from final URL; discard generic description
     maps_url = ""
-    if re.search(r'(maps\.google\.|google\.[a-z.]+/maps|maps\.app\.goo\.gl)', url + " " + final_url, re.IGNORECASE):
+    is_maps_url = re.search(
+        r'(maps\.google\.|google\.[a-z.]+/maps|maps\.app\.goo\.gl|share\.google/)',
+        url + " " + final_url, re.IGNORECASE)
+    if is_maps_url:
         maps_url = final_url
         place = ""
+        # Try to extract place from final URL path or query string
         pm = re.search(r'/maps/place/([^/@?&#]+)', final_url)
         if pm:
-            place = unquote_plus(pm.group(1))
+            place = unquote_plus(pm.group(1)).replace('+', ' ').strip()
         else:
             qm = re.search(r'[?&]q=([^&#]+)', final_url)
             if qm:
                 place = unquote_plus(qm.group(1)).split(',')[0].strip()
+        # If still no place (e.g. share.google JS redirect), try OG title from HTML
+        if not place and title:
+            GENERIC_TITLES = {"google maps", "maps", "google", "google search", ""}
+            if title.lower().strip() not in GENERIC_TITLES:
+                place = title  # OG title is already the place name
         if place:
             title = place[:200]
         desc = ""   # Google Maps' meta description is always useless
@@ -414,8 +423,9 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
         f"   • Video reviewing a product → category=product, name=the product\n"
         f"   • Use category=video ONLY if the video itself is what matters (tutorial, documentary)\n"
         f"2. Extract the EXACT name. If the title contains '📍Name' or 'bar Name' or 'restaurant Name', use that exact name.\n"
-        f"3. Extract the RATING from the web info if present (e.g. '4.5/5', '8.7/10', '4 stars').\n"
-        f"4. Summarise the REVIEW CONSENSUS — what do people say about it? Mention specific highlights or complaints.\n"
+        f"3. Extract the RATING from the web info if present (e.g. '4.5/5', '8.7/10', '4 stars'). Leave empty if not found.\n"
+        f"4. Summarise the REVIEW CONSENSUS using ONLY facts from the web info above. "
+        f"If web info is empty or has no reviews, write a factual one-line description only — NEVER invent ratings, visitor quotes, or review summaries.\n"
         f"5. Generate a maps_link: Google Maps search URL for the place.\n\n"
         f"Categories: location, product, article, video, recipe, other\n\n"
         f"Return ONLY valid JSON, no markdown:\n"
@@ -1300,7 +1310,14 @@ async def telegram_webhook(req: Request):
             ((pid, p) for pid, p in PENDING.items() if p.get("chat_id") == chat_id),
             None,
         )
-        if pending_entry:
+        # Questions get routed to chat even when there's a pending action
+        is_question = (
+            text.strip().endswith("?") or
+            bool(re.search(
+                r'^\s*(what|when|where|how|show|find|list|do i|have i|tell me|which|who|why)',
+                text, re.IGNORECASE))
+        )
+        if pending_entry and not is_question:
             pid, pending = pending_entry
             await handle_pending_modification(chat_id, text, pid, pending)
         else:
