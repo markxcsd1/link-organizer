@@ -470,21 +470,31 @@ async def notion_search(query: str) -> list:
     r.raise_for_status()
     results = []
     for obj in r.json().get("results", []):
-        props = obj.get("properties", {})
+        obj_type = obj.get("object", "page")
         title = "Untitled"
-        url = ""
-        for val in props.values():
-            if val.get("type") == "title":
-                items = val.get("title", [])
-                if items:
-                    title = items[0].get("plain_text") or items[0].get("text", {}).get("content", "Untitled")
+        url   = ""
+
+        if obj_type == "database":
+            # Database titles are at the top-level title array, NOT in properties
+            title_arr = obj.get("title", [])
+            if title_arr:
+                title = title_arr[0].get("plain_text", "") or "Untitled"
+        else:
+            # Page titles are inside properties
+            props = obj.get("properties", {})
+            for val in props.values():
+                if val.get("type") == "title":
+                    items = val.get("title", [])
+                    if items:
+                        title = items[0].get("plain_text") or items[0].get("text", {}).get("content", "Untitled")
+                        break
+            for val in props.values():
+                if val.get("type") == "url":
+                    url = val.get("url") or ""
                     break
-        for val in props.values():
-            if val.get("type") == "url":
-                url = val.get("url") or ""
-                break
+
         results.append({"id": obj.get("id",""), "title": title, "url": url,
-                         "notion_url": obj.get("url", ""), "object": obj.get("object", "page")})
+                         "notion_url": obj.get("url", ""), "object": obj_type})
     return results
 
 async def notion_fetch_page_meta(page_id: str) -> dict:
@@ -601,18 +611,30 @@ async def insert_into_trip_db(db_id: str, pending: dict) -> str:
     return r.json()["url"]
 
 async def notion_find_related(search_terms: list) -> list:
-    seen = set()
-    related = []
+    """Find related Notion pages/databases. Databases (island DBs) are ranked first."""
+    seen_ids    = set()
+    seen_titles = set()
+    databases   = []
+    pages       = []
     for term in search_terms[:3]:
         try:
-            pages = await notion_search(term)
-            for p in pages[:4]:
-                if p["id"] and p["id"] not in seen and p["title"] != "Untitled":
-                    seen.add(p["id"])
-                    related.append(p)
+            results = await notion_search(term)
+            for p in results[:6]:
+                if not p["id"] or p["id"] in seen_ids or p["title"] in ("Untitled", ""):
+                    continue
+                norm_title = p["title"].lower().strip()
+                if norm_title in seen_titles:
+                    continue
+                seen_ids.add(p["id"])
+                seen_titles.add(norm_title)
+                if p.get("object") == "database":
+                    databases.append(p)
+                else:
+                    pages.append(p)
         except Exception:
             pass
-    return related[:4]
+    # Databases first (island DBs), then plain pages — cap at 4 total
+    return (databases + pages)[:4]
 
 async def notion_read_page_content(page_id: str, max_chars: int = 3000, _depth: int = 0) -> str:
     """Read the text content of a Notion page (its blocks), recursing into toggles and child pages."""
