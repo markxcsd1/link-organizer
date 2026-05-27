@@ -483,7 +483,8 @@ async def notion_search(query: str) -> list:
             if val.get("type") == "url":
                 url = val.get("url") or ""
                 break
-        results.append({"id": obj.get("id",""), "title": title, "url": url, "notion_url": obj.get("url", "")})
+        results.append({"id": obj.get("id",""), "title": title, "url": url,
+                         "notion_url": obj.get("url", ""), "object": obj.get("object", "page")})
     return results
 
 async def notion_fetch_page_meta(page_id: str) -> dict:
@@ -506,6 +507,98 @@ async def notion_fetch_page_meta(page_id: str) -> dict:
                 "url": data.get("url", "")}
     except Exception:
         return {}
+
+async def notion_query_db_rows(db_id: str, limit: int = 20) -> list:
+    """Query all rows of an island/trip database."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            f"https://api.notion.com/v1/databases/{db_id}/query",
+            headers=NOTION_HEADERS,
+            json={"sorts": [{"property": "Name", "direction": "ascending"}], "page_size": limit},
+        )
+    if r.status_code != 200:
+        return []
+    rows = []
+    for page in r.json().get("results", []):
+        props = page.get("properties", {})
+        name    = (props.get("Name", {}).get("title") or [{}])[0].get("plain_text", "Untitled")
+        type_s  = props.get("Type", {}).get("select") or {}
+        loc_rt  = props.get("Location", {}).get("rich_text", [])
+        rat_rt  = props.get("Rating", {}).get("rich_text", [])
+        rows.append({
+            "name":     name,
+            "type":     type_s.get("name", ""),
+            "location": loc_rt[0].get("plain_text", "") if loc_rt else "",
+            "rating":   rat_rt[0].get("plain_text", "") if rat_rt else "",
+            "notion_url": page.get("url", ""),
+        })
+    return rows
+
+_TYPE_MAP = {
+    "restaurant": "Restaurant", "tavern": "Restaurant", "taverna": "Restaurant",
+    "bar": "Bar", "wine bar": "Bar", "beach bar": "Bar",
+    "cafe": "Cafe", "coffee": "Cafe", "kafeneio": "Cafe",
+    "beach": "Beach",
+    "hotel": "Hotel", "hostel": "Hotel", "villa": "Hotel", "airbnb": "Hotel",
+    "village": "Village", "town": "Village",
+    "museum": "Museum", "gallery": "Museum",
+    "shop": "Shop", "store": "Shop", "market": "Shop",
+    "church": "Sight", "monastery": "Sight", "castle": "Sight", "ruins": "Sight",
+    "sight": "Sight", "viewpoint": "Sight",
+}
+_VALID_TYPES = {"Restaurant","Bar","Cafe","Beach","Hotel","Village","Museum","Shop","Sight","Other"}
+
+def _map_type(raw: str) -> str:
+    if not raw:
+        return ""
+    if raw in _VALID_TYPES:
+        return raw
+    lower = raw.lower()
+    for k, v in _TYPE_MAP.items():
+        if k in lower:
+            return v
+    return "Other"
+
+async def insert_into_trip_db(db_id: str, pending: dict) -> str:
+    """Insert a place as a row into an island/trip database."""
+    name     = pending.get("name", "")
+    url      = pending.get("url", "") or "https://placeholder.com"
+    maps     = pending.get("maps_link", "")
+    type_raw = pending.get("type_", "")
+    location = pending.get("location", "")
+    rating   = pending.get("rating", "")
+    notes    = pending.get("notes", "")
+    vibe     = pending.get("vibe", "")
+    best_for = pending.get("best_for", "")
+    type_val = _map_type(type_raw)
+
+    props: dict = {
+        "Name": {"title": [{"text": {"content": name[:200]}}]},
+        "URL":  {"url": url},
+    }
+    if maps:
+        props["Maps"] = {"url": maps}
+    if type_val:
+        props["Type"] = {"select": {"name": type_val}}
+    if location:
+        props["Location"] = {"rich_text": _rich_text(location)}
+    if rating:
+        props["Rating"]   = {"rich_text": _rich_text(rating)}
+    if notes:
+        props["Notes"]    = {"rich_text": _rich_text(notes)}
+    if vibe:
+        props["Vibe"]     = {"rich_text": _rich_text(vibe)}
+    if best_for:
+        props["Best For"] = {"rich_text": _rich_text(best_for)}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            "https://api.notion.com/v1/pages",
+            headers=NOTION_HEADERS,
+            json={"parent": {"database_id": db_id}, "properties": props},
+        )
+    r.raise_for_status()
+    return r.json()["url"]
 
 async def notion_find_related(search_terms: list) -> list:
     seen = set()
@@ -918,10 +1011,12 @@ async def handle_save_link(chat_id: int, url: str, note: str):
         "ai_category":   ai_category,
         "related_pages": related_pages,
         "maps_link":     maps_link,
-        # Extra fields for trip DB
+        # Extra fields for island DB insert
         "type_":         type_,
         "location":      location,
         "rating":        rating,
+        "vibe":          vibe,
+        "best_for":      best_for,
     }
 
     emoji = CATEGORY_EMOJI.get(category, "📌")
@@ -1074,8 +1169,10 @@ async def handle_callback_query(cq: dict):
         await tg_edit_buttons(chat_id, message_id,
                               cq["message"]["text"] + f"\n\n_Adding to \"{page_title}\"…_")
         try:
-            if NOTION_DB_TRIP_PLACES:
-                notion_url = await trip_places_add(pending, page_title)
+            # Check if the target is a database (island DB) or a plain page
+            target_obj = next((p.get("object","page") for p in pending.get("related_pages",[]) if p["id"]==page_id), "page")
+            if target_obj == "database":
+                notion_url = await insert_into_trip_db(page_id, pending)
             else:
                 notion_url = await notion_append_to_page(
                     page_id, pending["name"], pending["url"], pending["notes"],
@@ -1178,22 +1275,19 @@ async def handle_pending_modification(chat_id: int, text: str, pid: str, pending
                 return
             await tg_send(chat_id, f"➕ Adding to \"{page_query}\"…")
             try:
-                if NOTION_DB_TRIP_PLACES:
-                    # Use the Trip Places database — cleaner and more reliable
-                    notion_url = await trip_places_add(pending_item, page_query)
-                    label = page_query
+                pages = await notion_search(page_query)
+                target = next((p for p in pages if page_query.lower() in p["title"].lower()), None)
+                target = target or (pages[0] if pages else None)
+                if not target:
+                    await tg_send(chat_id, f"❌ Couldn't find \"{page_query}\" in Notion.")
+                    return
+                label = target["title"]
+                if target.get("object") == "database":
+                    notion_url = await insert_into_trip_db(target["id"], pending_item)
                 else:
-                    # Fall back to page append
-                    pages = await notion_search(page_query)
-                    target = next((p for p in pages if page_query.lower() in p["title"].lower()), None)
-                    target = target or (pages[0] if pages else None)
-                    if not target:
-                        await tg_send(chat_id, f"❌ Couldn't find a Notion page called \"{page_query}\".")
-                        return
                     notion_url = await notion_append_to_page(
                         target["id"], pending_item["name"], pending_item["url"], pending_item["notes"],
                         pending_item.get("type_", ""), pending_item.get("location", ""), pending_item.get("rating", ""))
-                    label = target["title"]
                 await save_log(pending_item["url"], pending_item["notes"], pending_item.get("forced"),
                                pending_item.get("ai_category", ""), pending_item.get("category", ""),
                                pending_item["name"], "✓ success (addto)")
@@ -1376,17 +1470,30 @@ async def handle_chat(chat_id: int, text: str):
         pass
 
     # Read the CONTENT of the top 3 most relevant pages
-    # This allows answering questions like "how much is the ferry?" or "what did I save for Sifnos?"
+    # For databases (island/trip DBs), query rows instead of reading page blocks
     pages_read = 0
     for page in notion_results[:3]:
-        if page.get("id") and pages_read < 3:
-            try:
+        if not page.get("id") or pages_read >= 3:
+            continue
+        try:
+            if page.get("object") == "database":
+                rows = await notion_query_db_rows(page["id"], limit=20)
+                if rows:
+                    context_lines.append(f"\nPlaces in '{page['title']}':")
+                    for row in rows:
+                        line = f"- {row['name']}"
+                        if row.get("type"):     line += f" ({row['type']})"
+                        if row.get("location"): line += f" — {row['location']}"
+                        if row.get("rating"):   line += f" ⭐ {row['rating']}"
+                        context_lines.append(line)
+                    pages_read += 1
+            else:
                 content = await notion_read_page_content(page["id"], max_chars=1200)
                 if content and len(content) > 30:
                     context_lines.append(f"\nContent of '{page['title']}':\n{content}")
                     pages_read += 1
-            except Exception:
-                pass
+        except Exception:
+            pass
 
     # Also traverse parent pages — e.g. "Sifnos" page may live inside "Summer 2026"
     seen_parents: set = set()
@@ -1430,25 +1537,6 @@ async def handle_chat(chat_id: int, text: str):
                         f"\nChild page '{child['title']}' (inside '{page['title']}'):\n{child_content}"
                     )
                     added += 1
-        except Exception:
-            pass
-
-    # Also query Trip Places database for relevant trip entries
-    if NOTION_DB_TRIP_PLACES:
-        try:
-            # Extract a trip name from the search query (any word that looks like a place)
-            for word in search_query.split():
-                if len(word) > 3:
-                    trip_places = await trip_places_query(word.strip(",.?!"))
-                    if trip_places:
-                        context_lines.append(f"\nTrip Places for '{word}':")
-                        for tp in trip_places:
-                            line = f"- {tp['name']}"
-                            if tp.get("type"):     line += f" ({tp['type']})"
-                            if tp.get("location"): line += f" — {tp['location']}"
-                            if tp.get("rating"):   line += f" ⭐ {tp['rating']}"
-                            context_lines.append(line)
-                        break
         except Exception:
             pass
 
