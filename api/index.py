@@ -153,12 +153,38 @@ async def groq_chat(messages: list, max_tokens: int = 512) -> str:
 async def fetch_page_meta(url: str) -> dict:
     """
     Generic metadata fetch — one request, follow all redirects, then:
-    1. oEmbed auto-discovery (YouTube, Vimeo, Twitter, SoundCloud, etc.)
-    2. Open Graph tags
-    3. Standard <title> / meta description
-    4. Google Maps: extract place name from final URL
+    1. YouTube direct oEmbed (always reliable, handles Shorts)
+    2. oEmbed auto-discovery for other platforms
+    3. Open Graph tags
+    4. Standard <title> / meta description
+    5. Google Maps: extract place name from final URL
     """
     title, desc, author, final_url, html = "", "", "", url, ""
+
+    # Fast path: YouTube direct oEmbed (page HTML is unreliable due to consent screens)
+    if re.search(r'(youtube\.com|youtu\.be)', url, re.IGNORECASE):
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                oe = await client.get(f"https://www.youtube.com/oembed?url={url}&format=json")
+            if oe.status_code == 200:
+                od = oe.json()
+                title  = od.get("title", "")[:200]
+                author = od.get("author_name", "")
+                if title:
+                    # Try to grab the video description from page source
+                    try:
+                        async with httpx.AsyncClient(timeout=8, follow_redirects=True,
+                            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}) as client:
+                            rp = await client.get(url)
+                        m = re.search(r'"shortDescription":"((?:[^"\\]|\\.){0,1500})"', rp.text)
+                        if m:
+                            desc = m.group(1).replace("\\n", "\n").replace('\\"', '"')[:800]
+                    except Exception:
+                        pass
+                    return {"title": title, "desc": desc or f"YouTube video by {author}",
+                            "author": author, "final_url": url, "maps_url": ""}
+        except Exception:
+            pass
 
     try:
         async with httpx.AsyncClient(
