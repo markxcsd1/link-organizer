@@ -1,4 +1,4 @@
-import os, json, re, secrets, uuid, asyncio, httpx
+import os, json, re, secrets, uuid, httpx
 from urllib.parse import unquote_plus
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
@@ -10,9 +10,8 @@ NOTION_KEY       = os.environ["NOTION_API_KEY"]
 SECRET_KEY       = os.environ["SECRET_KEY"]
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_USER_ID = os.environ.get("TELEGRAM_USER_ID", "")
-GITHUB_TOKEN        = os.environ.get("GITHUB_TOKEN", "")
-GITHUB_REPO         = os.environ.get("GITHUB_REPO", "markxcsd1/obsidian-vault")
-GOOGLE_PLACES_KEY   = os.environ.get("GOOGLE_PLACES_API_KEY", "")
+GITHUB_TOKEN     = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO      = os.environ.get("GITHUB_REPO", "markxcsd1/obsidian-vault")
 
 NOTION_DB = {
     "location": os.environ["NOTION_DB_LOCATION"],
@@ -337,35 +336,6 @@ async def web_search(query: str) -> str:
 
     return "\n".join(parts)[:1000]
 
-async def fetch_google_places_rating(name: str, location: str = "") -> dict:
-    """
-    Google Places API — returns the real Google Maps rating + review count.
-    Free tier: $200/month credit (~6 000 requests). Requires GOOGLE_PLACES_API_KEY.
-    """
-    if not GOOGLE_PLACES_KEY:
-        return {}
-    query = f"{name} {location}".strip()
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            # Step 1: find the place
-            r = await client.get(
-                "https://maps.googleapis.com/maps/api/place/findplacefromtext/json",
-                params={"input": query, "inputtype": "textquery",
-                        "fields": "place_id,name,rating,user_ratings_total",
-                        "key": GOOGLE_PLACES_KEY})
-        if r.status_code == 200:
-            candidates = r.json().get("candidates", [])
-            if candidates:
-                c = candidates[0]
-                return {
-                    "rating":  str(c.get("rating", "")),
-                    "reviews": str(c.get("user_ratings_total", "")),
-                    "name":    c.get("name", ""),
-                }
-    except Exception:
-        pass
-    return {}
-
 async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
     """Deep analysis: extract the actual subject, do a web lookup for extra details."""
     title = meta.get("title", "")
@@ -401,15 +371,24 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
                 location_hint = loc_match.group(1).strip()[:60]
 
         search_q = f"{candidate} {location_hint}".strip()
-        web_info, places_data = await asyncio.gather(
-            web_search(search_q),
-            fetch_google_places_rating(candidate, location_hint),
-        )
-        if places_data.get("rating"):
-            gmaps_line = f"Google Maps rating: {places_data['rating']}/5"
-            if places_data.get("reviews"):
-                gmaps_line += f" ({places_data['reviews']} reviews)"
-            web_info = gmaps_line + ("\n" + web_info if web_info else "")
+        web_info = await web_search(search_q)
+
+        # Pre-extract any rating found in the snippets so Groq doesn't miss it
+        rating_match = re.search(
+            r'rated?\s+([\d.]+)\s*(?:out of\s*[\d.]+|/\s*[\d.]+|stars?)?'
+            r'|(\d+\.\d)\s*/\s*5'
+            r'|\b([\d.]+)\s+(?:out of|/)\s*5',
+            web_info, re.IGNORECASE)
+        reviews_match = re.search(r'(\d[\d,]+)\s*(?:unbiased\s+)?reviews?', web_info, re.IGNORECASE)
+        source_match  = re.search(r'(tripadvisor|google|yelp|booking|trustpilot)', web_info, re.IGNORECASE)
+        if rating_match:
+            rating_val = next(g for g in rating_match.groups() if g)
+            rating_line = f"Rating: {rating_val}/5"
+            if reviews_match:
+                rating_line += f" ({reviews_match.group(1)} reviews)"
+            if source_match:
+                rating_line += f" — {source_match.group(1).title()}"
+            web_info = rating_line + "\n" + web_info
 
     meta_text = ""
     if title:
