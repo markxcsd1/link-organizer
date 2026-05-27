@@ -910,6 +910,41 @@ def _clean_topic_name(raw: str) -> str:
     return " ".join(parts)
 
 
+# Deterministic addto-intent regex — runs before the Groq classifier so that
+# "Save it in Sifnos" is never misread as a generic save. The pattern intentionally
+# requires BOTH a save/add verb AND a destination preposition + non-empty topic.
+_ADDTO_RE = re.compile(
+    r"""^\s*
+        (?:save|add|put|store|drop|stash)\s+   # verb
+        (?:it\s+|this\s+|that\s+)?             # optional pronoun
+        (?:in|to|into|under|inside)\s+         # destination preposition
+        (.+?)\s*$                              # the topic
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _detect_addto_intent(text: str) -> str | None:
+    """Return the topic if `text` is an explicit 'save to <topic>' command, else None.
+
+    Strips noise like 'my', 'the', 'our' prefix and ' list / page / database / db / trip'
+    suffix so the topic comes out clean for Notion search.
+    """
+    if not text:
+        return None
+    m = _ADDTO_RE.match(text)
+    if not m:
+        return None
+    topic = m.group(1).strip()
+    if not topic:
+        return None
+    # Strip leading possessive/article
+    topic = re.sub(r"^(?:my|the|our)\s+", "", topic, flags=re.IGNORECASE).strip()
+    # Strip trailing collection-noun
+    topic = re.sub(r"\s+(?:list|page|database|db|trip)\b.*$", "", topic, flags=re.IGNORECASE).strip()
+    return topic or None
+
+
 async def notion_find_bucket_list() -> str | None:
     """Find the user's 'Bucket list' page id. Caches the result per invocation."""
     global _BUCKET_LIST_ID
@@ -1398,31 +1433,39 @@ async def handle_callback_query(cq: dict):
 
 
 async def handle_pending_modification(chat_id: int, text: str, pid: str, pending: dict):
-    current = json.dumps({
-        "name": pending.get("name", ""),
-        "category": pending.get("category", ""),
-        "notes": pending.get("notes", ""),
-    })
-    prompt = (
-        f"The user has a pending save action:\n{current}\n\n"
-        f"The user said: \"{text}\"\n\n"
-        f"Determine their intent. Return ONLY valid JSON:\n"
-        f'{{"action": "save", "category": "...", "name": "...", "notes": "...", "page": ""}}\n'
-        f"action must be one of: save, addto, cancel, modify\n"
-        f"- save: user said ok/yes/save/go ahead — keep all current values\n"
-        f"- addto: user wants to save to a specific named page/list (e.g. 'save to my Sifnos list', 'add to Tokyo'). Set page to the page name.\n"
-        f"- cancel: user wants to cancel\n"
-        f"- modify: user wants to change something — update only the mentioned fields, keep others unchanged\n"
-        f"Valid categories: location, product, article, video, recipe, other"
-    )
-    try:
-        raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=200)
-        raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
-        raw = re.sub(r"```$", "", raw.strip())
-        result = json.loads(_extract_json(raw))
-    except Exception:
-        await tg_send(chat_id, "Didn't understand that — use the buttons or say *save*, *cancel*, or describe a change.")
-        return
+    # Deterministic fast path: "save it in <topic>" / "add to <topic>" etc.
+    # Skip the Groq classifier entirely — it was misreading these as plain "save".
+    forced_topic = _detect_addto_intent(text)
+    if forced_topic:
+        result = {"action": "addto", "page": forced_topic}
+    else:
+        current = json.dumps({
+            "name": pending.get("name", ""),
+            "category": pending.get("category", ""),
+            "notes": pending.get("notes", ""),
+        })
+        prompt = (
+            f"The user has a pending save action:\n{current}\n\n"
+            f"The user said: \"{text}\"\n\n"
+            f"Determine their intent. Return ONLY valid JSON:\n"
+            f'{{"action": "save", "category": "...", "name": "...", "notes": "...", "page": ""}}\n'
+            f"action must be one of: save, addto, cancel, modify\n"
+            f"- save: user said ok/yes/save/go ahead — keep all current values\n"
+            f"- addto: user wants to save to a SPECIFIC named page/list/topic. "
+            f"Examples: 'save to Sifnos', 'save it in Tokyo', 'add to my Amorgos list', "
+            f"'put it under Japan trip', 'store this in Tokyo'. Set page to the topic name (no 'my' or 'list').\n"
+            f"- cancel: user wants to cancel\n"
+            f"- modify: user wants to change something — update only the mentioned fields, keep others unchanged\n"
+            f"Valid categories: location, product, article, video, recipe, other"
+        )
+        try:
+            raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=200)
+            raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
+            raw = re.sub(r"```$", "", raw.strip())
+            result = json.loads(_extract_json(raw))
+        except Exception:
+            await tg_send(chat_id, "Didn't understand that — use the buttons or say *save*, *cancel*, or describe a change.")
+            return
 
     action = result.get("action", "modify")
 
@@ -2020,4 +2063,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "bucket-list"}
+    return {"ok": True, "v": "addto-regex"}
