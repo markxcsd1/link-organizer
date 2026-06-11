@@ -1199,13 +1199,48 @@ async def analyse_game_link(url: str, meta: dict) -> dict:
     return result
 
 
+_VIDEO_URL_RE = re.compile(
+    r'(youtube\.com/watch|youtu\.be/|vimeo\.com/\d)', re.IGNORECASE
+)
+
+def _is_video_url(url: str) -> bool:
+    return bool(_VIDEO_URL_RE.search(url))
+
+
+async def find_game_trailer(game_name: str) -> str:
+    """Search DuckDuckGo for a YouTube trailer. Returns the first YouTube URL found."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=10, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                     "Accept-Language": "en-US,en;q=0.9"},
+        ) as client:
+            r = await client.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": f"{game_name} official trailer youtube"},
+            )
+        if r.status_code != 200:
+            return ""
+        # DuckDuckGo wraps external URLs as /l/?uddg=<percent-encoded url>
+        from urllib.parse import unquote
+        for m in re.finditer(r'uddg=(https?[^&"\']+)', r.text):
+            decoded = unquote(m.group(1))
+            if "youtube.com/watch" in decoded or "youtu.be/" in decoded:
+                return decoded
+    except Exception:
+        pass
+    return ""
+
+
 async def save_game_to_notion(game: dict) -> str:
     """Insert a row into the 'To Play' game database."""
     props: dict = {
         "Name": {"title": [{"text": {"content": (game.get("name") or "")[:200]}}]},
     }
-    if game.get("url"):
-        props["Review"] = {"url": game["url"]}
+    if game.get("review_url"):
+        props["Review"] = {"url": game["review_url"]}
+    if game.get("video_url"):
+        props["Video"] = {"url": game["video_url"]}
     if game.get("developer"):
         props["Developer"] = {"rich_text": _rich_text(game["developer"])}
     genres = game.get("genres") or []
@@ -1218,8 +1253,6 @@ async def save_game_to_notion(game: dict) -> str:
         props["Status"] = {"select": {"name": game["status"]}}
     if game.get("hype") in ("★★★", "★★", "★"):
         props["Hype"] = {"select": {"name": game["hype"]}}
-    if game.get("release_date"):
-        props["Release Date"] = {"date": {"start": game["release_date"]}}
 
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
@@ -1244,17 +1277,25 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
         await tg_send(chat_id, f"❌ Game analysis failed: {e}")
         return
 
-    name       = _clean_field(game_data.get("name", "")) or meta.get("title", "") or url
-    developer  = _clean_field(game_data.get("developer", ""))
-    genres     = _map_game_genres(game_data.get("genres") or [])
-    platforms  = _map_game_platforms(game_data.get("platforms") or [])
-    status     = game_data.get("status", "Out")
+    name      = _clean_field(game_data.get("name", "")) or meta.get("title", "") or url
+    developer = _clean_field(game_data.get("developer", ""))
+    genres    = _map_game_genres(game_data.get("genres") or [])
+    platforms = _map_game_platforms(game_data.get("platforms") or [])
+    status    = game_data.get("status", "Out")
     if status not in ("Unreleased", "Out", "Playing", "Finished"):
         status = "Out"
-    release_date = _clean_field(game_data.get("release_date", ""))
-    summary      = game_data.get("summary", "")
+    summary = game_data.get("summary", "")
     if note:
         summary = note + (" — " + summary if summary else "")
+
+    # Video: if the shared URL is a video use it directly; otherwise search for a trailer
+    if _is_video_url(url):
+        video_url  = url
+        review_url = ""
+    else:
+        review_url = url
+        video_url  = await find_game_trailer(name) if name else ""
+    print(f"[game] video_url={video_url!r}")
 
     pid = str(uuid.uuid4())[:8]
     PENDING[pid] = {
@@ -1271,7 +1312,8 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
         "genres":       genres,
         "platforms":    platforms,
         "status":       status,
-        "release_date": release_date,
+        "review_url":   review_url,
+        "video_url":    video_url,
     }
 
     lines = [f"🎮 *{name}*"]
@@ -1281,13 +1323,10 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
         lines.append("🏷️ " + "  ·  ".join(genres))
     if platforms:
         lines.append("🖥️ " + "  ·  ".join(platforms))
-    detail_parts = []
     if status:
-        detail_parts.append(status)
-    if release_date:
-        detail_parts.append(f"📅 {release_date}")
-    if detail_parts:
-        lines.append("  ".join(detail_parts))
+        lines.append(status)
+    if video_url:
+        lines.append(f"🎬 [Trailer]({video_url})")
     if summary:
         lines.append(f"\n{summary}")
     lines.append("\n*How hyped?*")
@@ -1310,14 +1349,14 @@ async def _do_save_game(chat_id: int, pending: dict, message_id: int | None = No
     """Persist a game pending entry to the To Play Notion DB."""
     try:
         notion_url = await save_game_to_notion({
-            "name":         pending["name"],
-            "url":          pending["url"],
-            "developer":    pending.get("developer", ""),
-            "genres":       pending.get("genres", []),
-            "platforms":    pending.get("platforms", []),
-            "status":       pending.get("status", "Out"),
-            "hype":         pending.get("hype", ""),
-            "release_date": pending.get("release_date", ""),
+            "name":       pending["name"],
+            "review_url": pending.get("review_url", ""),
+            "video_url":  pending.get("video_url", ""),
+            "developer":  pending.get("developer", ""),
+            "genres":     pending.get("genres", []),
+            "platforms":  pending.get("platforms", []),
+            "status":     pending.get("status", "Out"),
+            "hype":       pending.get("hype", ""),
         })
     except Exception as e:
         msg = f"❌ Failed to save: {e}"
@@ -2467,4 +2506,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-db-igdb"}
+    return {"ok": True, "v": "game-video"}
