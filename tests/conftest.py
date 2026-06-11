@@ -16,6 +16,8 @@ _ENV_STUBS = {
     "NOTION_DB_RECIPE":    "rec-db-id",
     "NOTION_DB_OTHER":     "oth-db-id",
     "NOTION_DB_GAME":      "game-db-id",
+    "TWITCH_CLIENT_ID":    "test-twitch-id",
+    "TWITCH_CLIENT_SECRET":"test-twitch-secret",
 }
 
 for k, v in _ENV_STUBS.items():
