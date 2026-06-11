@@ -2533,7 +2533,7 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "igdb-debug-1"}
+    return {"ok": True, "v": "igdb-debug-2"}
 
 
 @app.get("/api/igdb-test")
