@@ -2533,4 +2533,32 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "igdb-fix-1"}
+    return {"ok": True, "v": "igdb-debug-1"}
+
+
+@app.get("/api/igdb-test")
+async def igdb_test(name: str = "Forza Horizon 6", key: str = ""):
+    if key != SECRET_KEY:
+        return {"error": "unauthorized"}
+    try:
+        token = await _get_igdb_token()
+        clean = re.sub(
+            r'\s*[-|:]\s*(steam|on steam|buy|pc game|review|trailer|gameplay|official).*$',
+            '', name, flags=re.IGNORECASE,
+        ).strip()
+        query = (
+            f'search "{clean}"; '
+            f'fields name,summary,genres.name,platforms.name,'
+            f'involved_companies.company.name,involved_companies.developer,'
+            f'first_release_date; '
+            f'limit 1;'
+        )
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.post(
+                "https://api.igdb.com/v4/games",
+                headers={"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"},
+                content=query,
+            )
+        return {"status": r.status_code, "raw": r.json(), "query": query}
+    except Exception as e:
+        return {"error": str(e)}
