@@ -26,6 +26,8 @@ NOTION_DB = {
 NOTION_DB_LOGS        = os.environ.get("NOTION_DB_LOGS", "")
 NOTION_DB_TRIP_PLACES = os.environ.get("NOTION_DB_TRIP_PLACES", "")
 NOTION_DB_GAME        = os.environ.get("NOTION_DB_GAME", "")
+TWITCH_CLIENT_ID      = os.environ.get("TWITCH_CLIENT_ID", "")
+TWITCH_CLIENT_SECRET  = os.environ.get("TWITCH_CLIENT_SECRET", "")
 
 if NOTION_DB_GAME:
     NOTION_DB["game"] = NOTION_DB_GAME
@@ -55,6 +57,10 @@ MAX_HISTORY = 10
 
 # Cached "Bucket list" page id for the lifetime of this serverless invocation
 _BUCKET_LIST_ID: str | None = None
+
+# IGDB OAuth token cache (valid ~60 days; re-fetched when expired)
+_IGDB_TOKEN: str = ""
+_IGDB_TOKEN_EXPIRY: float = 0.0
 
 HELP_TEXT = """*Your personal knowledge assistant* 🧠
 
@@ -982,27 +988,44 @@ def _is_game_url(url: str) -> bool:
     return bool(_GAME_URL_RE.search(url))
 
 _GAME_GENRE_MAP: dict[str, str] = {
+    # Roguelite / Roguelike
     "roguelite": "Roguelite", "rogue-lite": "Roguelite",
     "roguelike": "Roguelike", "rogue-like": "Roguelike",
+    # Deckbuilder
     "deckbuilder": "Deckbuilder", "deck builder": "Deckbuilder",
     "deck-builder": "Deckbuilder", "deckbuilding": "Deckbuilder",
+    # Metroidvania
     "metroidvania": "Metroidvania",
+    # Action (also covers IGDB "Hack and slash", "Shooter", "Beat 'em up")
     "action": "Action", "action-adventure": "Action", "action adventure": "Action",
+    "hack and slash": "Action", "beat 'em up": "Action", "beat em up": "Action",
+    "shooter": "Action",
+    # Platformer (IGDB uses "Platform")
     "platformer": "Platformer", "platform": "Platformer",
+    # Survivors-like
     "survivors-like": "Survivors-like", "survivors like": "Survivors-like",
     "survivor": "Survivors-like", "bullet heaven": "Survivors-like",
+    # Strategy (IGDB uses "Real Time Strategy (RTS)", "Turn-based strategy (TBS)")
     "strategy": "Strategy", "turn-based": "Strategy", "rts": "Strategy",
-    "rpg": "RPG", "role-playing": "RPG", "role playing": "RPG",
+    "real time strategy": "Strategy", "turn-based strategy": "Strategy",
+    # RPG (IGDB uses "Role-playing (RPG)")
+    "rpg": "RPG", "role-playing": "RPG", "role playing": "RPG", "role-playing (rpg)": "RPG",
 }
 _VALID_GAME_GENRES = frozenset({"Roguelite", "Roguelike", "Deckbuilder", "Metroidvania",
                                  "Action", "Platformer", "Survivors-like", "Strategy", "RPG"})
 
 _GAME_PLATFORM_MAP: dict[str, str] = {
+    # Longest keys first to avoid prefix conflicts (sorted at call time, but explicit order helps)
+    "pc (microsoft windows)": "PC", "microsoft windows": "PC",
     "steam deck": "Steam Deck",
+    "nintendo switch": "Switch",
+    "playstation 5": "PS5", "ps5": "PS5",
+    "xbox series x|s": "Xbox", "xbox series x": "Xbox", "xbox series s": "Xbox",
+    "xbox series": "Xbox",
     "pc": "PC", "windows": "PC", "mac": "PC", "linux": "PC", "steam": "PC",
-    "switch": "Switch", "nintendo switch": "Switch", "nintendo": "Switch",
-    "ps5": "PS5", "playstation 5": "PS5", "playstation": "PS5",
-    "xbox": "Xbox", "xbox series": "Xbox",
+    "switch": "Switch", "nintendo": "Switch",
+    "playstation": "PS5",
+    "xbox": "Xbox",
 }
 _VALID_GAME_PLATFORMS = frozenset({"PC", "Switch", "PS5", "Xbox", "Steam Deck"})
 
@@ -1045,10 +1068,109 @@ def _map_game_platforms(raw: list) -> list:
     return result
 
 
+async def _get_igdb_token() -> str:
+    """Return a cached IGDB/Twitch app-access token, refreshing when expired."""
+    import time
+    global _IGDB_TOKEN, _IGDB_TOKEN_EXPIRY
+    if _IGDB_TOKEN and time.time() < _IGDB_TOKEN_EXPIRY - 60:
+        return _IGDB_TOKEN
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            "https://id.twitch.tv/oauth2/token",
+            params={
+                "client_id":     TWITCH_CLIENT_ID,
+                "client_secret": TWITCH_CLIENT_SECRET,
+                "grant_type":    "client_credentials",
+            },
+        )
+    r.raise_for_status()
+    data = r.json()
+    _IGDB_TOKEN        = data["access_token"]
+    _IGDB_TOKEN_EXPIRY = time.time() + data.get("expires_in", 3600)
+    return _IGDB_TOKEN
+
+
+async def igdb_search_game(name: str) -> dict:
+    """Search IGDB for a game by name; return structured dict or {} on miss."""
+    token = await _get_igdb_token()
+    # Strip common store-page suffixes from page titles
+    clean = re.sub(
+        r'\s*[-|:]\s*(steam|on steam|buy|pc game|review|trailer|gameplay|official).*$',
+        '', name, flags=re.IGNORECASE,
+    ).strip()
+    query = (
+        f'search "{clean}"; '
+        f'fields name,summary,genres.name,platforms.name,'
+        f'involved_companies.company.name,involved_companies.developer,'
+        f'first_release_date; '
+        f'limit 1;'
+    )
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.post(
+            "https://api.igdb.com/v4/games",
+            headers={
+                "Client-ID":     TWITCH_CLIENT_ID,
+                "Authorization": f"Bearer {token}",
+            },
+            content=query,
+        )
+    r.raise_for_status()
+    results = r.json()
+    if not results:
+        return {}
+    game = results[0]
+
+    developer = ""
+    for ic in game.get("involved_companies", []):
+        if ic.get("developer"):
+            developer = ic.get("company", {}).get("name", "")
+            break
+
+    genres    = _map_game_genres([g.get("name", "") for g in game.get("genres", [])])
+    platforms = _map_game_platforms([p.get("name", "") for p in game.get("platforms", [])])
+
+    release_date = ""
+    ts = game.get("first_release_date")
+    if ts:
+        from datetime import datetime, timezone
+        release_date = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    return {
+        "name":         game.get("name", clean),
+        "developer":    developer,
+        "genres":       genres,
+        "platforms":    platforms,
+        "release_date": release_date,
+        "summary":      (game.get("summary") or "")[:500],
+    }
+
+
 async def analyse_game_link(url: str, meta: dict) -> dict:
-    """Extract structured game data from a URL using page metadata + Groq knowledge."""
+    """Extract structured game data. Tries IGDB first; falls back to Groq."""
+    from datetime import date as _date
     title = meta.get("title", "")
     desc  = meta.get("desc", "")
+
+    # ── IGDB path ────────────────────────────────────────────────────────────
+    if TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and title:
+        try:
+            igdb = await igdb_search_game(title)
+            if igdb.get("name"):
+                # Derive status from release date
+                status = "Out"
+                if igdb.get("release_date"):
+                    try:
+                        rel = _date.fromisoformat(igdb["release_date"])
+                        status = "Unreleased" if rel > _date.today() else "Out"
+                    except ValueError:
+                        pass
+                igdb["status"] = status
+                igdb.setdefault("summary", desc[:300] if desc else "")
+                return igdb
+        except Exception as e:
+            print(f"[igdb] search failed: {e}")
+
+    # ── Groq fallback ─────────────────────────────────────────────────────────
     prompt = (
         f"Extract game details from this URL and metadata. Use your knowledge of the game if you recognise it.\n"
         f"URL: {url}\n"
@@ -1067,7 +1189,11 @@ async def analyse_game_link(url: str, meta: dict) -> dict:
     raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=400)
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
     raw = re.sub(r"```$", "", raw.strip())
-    return json.loads(_extract_json(raw))
+    result = json.loads(_extract_json(raw))
+    # Normalise genres/platforms through the same mappers
+    result["genres"]    = _map_game_genres(result.get("genres") or [])
+    result["platforms"] = _map_game_platforms(result.get("platforms") or [])
+    return result
 
 
 async def save_game_to_notion(game: dict) -> str:
@@ -2316,4 +2442,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-db"}
+    return {"ok": True, "v": "game-db-igdb"}

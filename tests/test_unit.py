@@ -309,6 +309,41 @@ class TestMapGamePlatforms:
         assert _map_game_platforms(raw) == expected
 
 
+# ── IGDB-specific name mapping ────────────────────────────────────────────────
+
+class TestIgdbGenreNames:
+    """IGDB returns genre names like 'Role-playing (RPG)' — must map correctly."""
+    @pytest.mark.parametrize("raw,expected", [
+        (["Role-playing (RPG)"],              ["RPG"]),
+        (["Platform"],                        ["Platformer"]),
+        (["Hack and slash/Beat 'em up"],      ["Action"]),
+        (["Shooter"],                         ["Action"]),
+        (["Real Time Strategy (RTS)"],        ["Strategy"]),
+        (["Turn-based strategy (TBS)"],       ["Strategy"]),
+        (["Metroidvania"],                    ["Metroidvania"]),
+        (["Indie"],                           []),   # no mapping
+        (["Role-playing (RPG)", "Strategy"],  ["RPG", "Strategy"]),
+    ])
+    def test_igdb_genre(self, raw, expected):
+        assert _map_game_genres(raw) == expected
+
+
+class TestIgdbPlatformNames:
+    """IGDB returns platform names like 'PC (Microsoft Windows)' — must map correctly."""
+    @pytest.mark.parametrize("raw,expected", [
+        (["PC (Microsoft Windows)"],          ["PC"]),
+        (["Nintendo Switch"],                 ["Switch"]),
+        (["PlayStation 5"],                   ["PS5"]),
+        (["Xbox Series X|S"],                 ["Xbox"]),
+        (["Steam Deck"],                      ["Steam Deck"]),
+        (["Mac"],                             ["PC"]),
+        (["Linux"],                           ["PC"]),
+        (["PC (Microsoft Windows)", "Mac"],   ["PC"]),   # dedup to single PC
+    ])
+    def test_igdb_platform(self, raw, expected):
+        assert _map_game_platforms(raw) == expected
+
+
 # ── _is_game_url ──────────────────────────────────────────────────────────────
 
 class TestIsGameUrl:
