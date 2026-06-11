@@ -1093,7 +1093,6 @@ async def _get_igdb_token() -> str:
 async def igdb_search_game(name: str) -> dict:
     """Search IGDB for a game by name; return structured dict or {} on miss."""
     token = await _get_igdb_token()
-    # Strip common store-page suffixes from page titles
     clean = re.sub(
         r'\s*[-|:]\s*(steam|on steam|buy|pc game|review|trailer|gameplay|official).*$',
         '', name, flags=re.IGNORECASE,
@@ -1116,18 +1115,36 @@ async def igdb_search_game(name: str) -> dict:
         )
     r.raise_for_status()
     results = r.json()
+    print(f"[igdb] query={clean!r} raw={results[:1]}")
     if not results:
         return {}
     game = results[0]
 
+    # involved_companies can come back as ints (unexpanded) — guard with isinstance
     developer = ""
     for ic in game.get("involved_companies", []):
-        if ic.get("developer"):
-            developer = ic.get("company", {}).get("name", "")
+        if not isinstance(ic, dict):
+            continue
+        company = ic.get("company")
+        if ic.get("developer") and isinstance(company, dict):
+            developer = company.get("name", "")
             break
+    # fallback: first company regardless of developer flag
+    if not developer:
+        for ic in game.get("involved_companies", []):
+            if not isinstance(ic, dict):
+                continue
+            company = ic.get("company")
+            if isinstance(company, dict) and company.get("name"):
+                developer = company["name"]
+                break
 
-    genres    = _map_game_genres([g.get("name", "") for g in game.get("genres", [])])
-    platforms = _map_game_platforms([p.get("name", "") for p in game.get("platforms", [])])
+    genres    = _map_game_genres([
+        g.get("name", "") for g in game.get("genres", []) if isinstance(g, dict)
+    ])
+    platforms = _map_game_platforms([
+        p.get("name", "") for p in game.get("platforms", []) if isinstance(p, dict)
+    ])
 
     release_date = ""
     ts = game.get("first_release_date")
@@ -1135,6 +1152,8 @@ async def igdb_search_game(name: str) -> dict:
         from datetime import datetime, timezone
         release_date = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
+    print(f"[igdb] parsed: developer={developer!r} release={release_date!r} "
+          f"genres={genres} platforms={platforms}")
     return {
         "name":         game.get("name", clean),
         "developer":    developer,
@@ -2514,4 +2533,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-video-2"}
+    return {"ok": True, "v": "igdb-fix-1"}
