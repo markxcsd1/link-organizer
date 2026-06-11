@@ -1164,21 +1164,61 @@ async def igdb_search_game(name: str) -> dict:
     }
 
 
+def _game_name_from_url(url: str) -> str:
+    """Pull a probable game name from the URL path slug."""
+    from urllib.parse import urlparse
+    path = urlparse(url).path
+    # Steam: /app/1234/Game_Name/
+    m = re.search(r'/app/\d+/([^/?#]+)', path)
+    if m:
+        return m.group(1).replace('_', ' ').replace('-', ' ').strip()
+    # Epic: /p/game-name or /*/p/game-name
+    m = re.search(r'/p/([^/?#]+)/?$', path)
+    if m:
+        return m.group(1).replace('-', ' ').strip()
+    # GOG: /game/game_name
+    m = re.search(r'/game/([^/?#]+)/?$', path)
+    if m:
+        return m.group(1).replace('_', ' ').replace('-', ' ').strip()
+    # Xbox: /games/store/game-name/...
+    m = re.search(r'/games/store/([^/?#]+)', path)
+    if m:
+        return m.group(1).replace('-', ' ').strip()
+    # Nintendo: /store/products/game-name or /store/items/game-name
+    m = re.search(r'/store/(?:products|items)/([^/?#]+)', path)
+    if m:
+        return m.group(1).replace('-', ' ').strip()
+    return ""
+
+
 async def analyse_game_link(url: str, meta: dict) -> dict:
     """Extract structured game data. Tries IGDB first; falls back to Groq."""
     from datetime import date as _date
     title = meta.get("title", "")
     desc  = meta.get("desc", "")
 
+    # If the page title looks generic (not a game name), try the URL slug instead
+    slug = _game_name_from_url(url)
+    _GENERIC_TITLE_HINTS = ("official site", "official website", "| xbox", "store | xbox",
+                             "playstation store", "nintendo store", "epic games store",
+                             "steam", "gog.com", "itch.io")
+    title_lc = title.lower()
+    if slug and (not title or any(h in title_lc for h in _GENERIC_TITLE_HINTS) or len(title) > 100):
+        print(f"[game] generic title {title!r}, using slug {slug!r}")
+        title = slug
+
     # ── IGDB path ────────────────────────────────────────────────────────────
     if TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and title:
         try:
             igdb = await igdb_search_game(title)
+            # If first attempt misses and we haven't tried the slug yet, retry with slug
+            if not igdb.get("name") and slug and slug.lower() != title.lower():
+                print(f"[igdb] miss on {title!r}, retrying with slug {slug!r}")
+                igdb = await igdb_search_game(slug)
             print(f"[igdb] hit={bool(igdb.get('name'))} name={igdb.get('name','')!r} "
                   f"release={igdb.get('release_date','')!r} genres={igdb.get('genres')} "
                   f"platforms={igdb.get('platforms')}")
             if igdb.get("name"):
-                # Derive status from release date
                 status = "Out"
                 if igdb.get("release_date"):
                     try:
@@ -2533,7 +2573,7 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "igdb-debug-3"}
+    return {"ok": True, "v": "igdb-slug-1"}
 
 
 @app.get("/api/igdb-test")
