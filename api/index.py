@@ -2533,7 +2533,7 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "igdb-debug-2"}
+    return {"ok": True, "v": "igdb-debug-3"}
 
 
 @app.get("/api/igdb-test")
@@ -2542,7 +2542,7 @@ async def igdb_test(url: str = "", name: str = "Forza Horizon 6"):
     try:
         meta = {}
         if url:
-            meta = await fetch_url_meta(url)
+            meta = await fetch_page_meta(url)
             name = meta.get("title", name)
         igdb_result = await igdb_search_game(name)
         analysed    = await analyse_game_link(url or f"https://store.steampowered.com/app/0/{name}/", meta or {"title": name})
