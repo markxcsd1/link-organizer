@@ -2537,9 +2537,7 @@ async def health():
 
 
 @app.get("/api/igdb-test")
-async def igdb_test(name: str = "Forza Horizon 6", authorization: str = Header(...)):
-    if not secrets.compare_digest(authorization, f"Bearer {SECRET_KEY}"):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+async def igdb_test(name: str = "Forza Horizon 6"):
     try:
         token = await _get_igdb_token()
         clean = re.sub(
