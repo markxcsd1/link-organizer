@@ -1155,6 +1155,9 @@ async def analyse_game_link(url: str, meta: dict) -> dict:
     if TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and title:
         try:
             igdb = await igdb_search_game(title)
+            print(f"[igdb] hit={bool(igdb.get('name'))} name={igdb.get('name','')!r} "
+                  f"release={igdb.get('release_date','')!r} genres={igdb.get('genres')} "
+                  f"platforms={igdb.get('platforms')}")
             if igdb.get("name"):
                 # Derive status from release date
                 status = "Out"
@@ -1287,12 +1290,19 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
         lines.append("  ".join(detail_parts))
     if summary:
         lines.append(f"\n{summary}")
-    lines.append("\n🎮 Save to *To Play* list?")
+    lines.append("\n*How hyped?*")
 
-    keyboard = [[
-        {"text": "✅ Save to To Play", "callback_data": f"save:{pid}"},
-        {"text": "❌ Cancel",          "callback_data": f"cancel:{pid}"},
-    ]]
+    keyboard = [
+        [
+            {"text": "🔥 ★★★",  "callback_data": f"hype:{pid}:3"},
+            {"text": "⭐ ★★",   "callback_data": f"hype:{pid}:2"},
+            {"text": "🙂 ★",    "callback_data": f"hype:{pid}:1"},
+        ],
+        [
+            {"text": "💾 Save (no hype)", "callback_data": f"save:{pid}"},
+            {"text": "❌ Cancel",          "callback_data": f"cancel:{pid}"},
+        ],
+    ]
     await tg_send_buttons(chat_id, "\n".join(lines), keyboard)
 
 
@@ -1306,6 +1316,7 @@ async def _do_save_game(chat_id: int, pending: dict, message_id: int | None = No
             "genres":       pending.get("genres", []),
             "platforms":    pending.get("platforms", []),
             "status":       pending.get("status", "Out"),
+            "hype":         pending.get("hype", ""),
             "release_date": pending.get("release_date", ""),
         })
     except Exception as e:
@@ -1685,6 +1696,20 @@ async def handle_callback_query(cq: dict):
     await tg_answer_callback(cq_id)
 
     if user_id != TELEGRAM_USER_ID:
+        return
+
+    if data.startswith("hype:"):
+        # hype:{pid}:{level} — set hype on a game pending item then save
+        parts = data.split(":", 2)
+        pid, level = parts[1], parts[2] if len(parts) > 2 else "2"
+        pending = PENDING.pop(pid, None)
+        if not pending:
+            await tg_edit_buttons(chat_id, message_id, "⏱ Action expired — send the link again.")
+            return
+        hype_map = {"3": "★★★", "2": "★★", "1": "★"}
+        pending["hype"] = hype_map.get(level, "★★")
+        await tg_edit_buttons(chat_id, message_id, cq["message"]["text"] + "\n\n_Saving…_")
+        await _do_save_link(chat_id, pending, message_id)
         return
 
     if data.startswith("save:"):
