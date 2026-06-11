@@ -2537,26 +2537,21 @@ async def health():
 
 
 @app.get("/api/igdb-test")
-async def igdb_test(name: str = "Forza Horizon 6"):
+async def igdb_test(url: str = "", name: str = "Forza Horizon 6"):
+    """Debug endpoint: fetch meta for url, run full analyse_game_link, show result."""
     try:
-        token = await _get_igdb_token()
-        clean = re.sub(
-            r'\s*[-|:]\s*(steam|on steam|buy|pc game|review|trailer|gameplay|official).*$',
-            '', name, flags=re.IGNORECASE,
-        ).strip()
-        query = (
-            f'search "{clean}"; '
-            f'fields name,summary,genres.name,platforms.name,'
-            f'involved_companies.company.name,involved_companies.developer,'
-            f'first_release_date; '
-            f'limit 1;'
-        )
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                "https://api.igdb.com/v4/games",
-                headers={"Client-ID": TWITCH_CLIENT_ID, "Authorization": f"Bearer {token}"},
-                content=query,
-            )
-        return {"status": r.status_code, "raw": r.json(), "query": query}
+        meta = {}
+        if url:
+            meta = await fetch_url_meta(url)
+            name = meta.get("title", name)
+        igdb_result = await igdb_search_game(name)
+        analysed    = await analyse_game_link(url or f"https://store.steampowered.com/app/0/{name}/", meta or {"title": name})
+        return {
+            "meta_title": name,
+            "meta":       meta,
+            "igdb_raw":   igdb_result,
+            "analysed":   analysed,
+        }
     except Exception as e:
-        return {"error": str(e)}
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
