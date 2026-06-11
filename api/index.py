@@ -1253,6 +1253,8 @@ async def save_game_to_notion(game: dict) -> str:
         props["Status"] = {"select": {"name": game["status"]}}
     if game.get("hype") in ("★★★", "★★", "★"):
         props["Hype"] = {"select": {"name": game["hype"]}}
+    if game.get("release_date"):
+        props["Release Date"] = {"date": {"start": game["release_date"]}}
 
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.post(
@@ -1281,10 +1283,11 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
     developer = _clean_field(game_data.get("developer", ""))
     genres    = _map_game_genres(game_data.get("genres") or [])
     platforms = _map_game_platforms(game_data.get("platforms") or [])
-    status    = game_data.get("status", "Out")
+    status       = game_data.get("status", "Out")
     if status not in ("Unreleased", "Out", "Playing", "Finished"):
         status = "Out"
-    summary = game_data.get("summary", "")
+    release_date = _clean_field(game_data.get("release_date", ""))
+    summary      = game_data.get("summary", "")
     if note:
         summary = note + (" — " + summary if summary else "")
 
@@ -1311,9 +1314,10 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
         "developer":    developer,
         "genres":       genres,
         "platforms":    platforms,
-        "status":       status,
-        "review_url":   review_url,
-        "video_url":    video_url,
+        "status":        status,
+        "release_date":  release_date,
+        "review_url":    review_url,
+        "video_url":     video_url,
     }
 
     lines = [f"🎮 *{name}*"]
@@ -1323,8 +1327,11 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
         lines.append("🏷️ " + "  ·  ".join(genres))
     if platforms:
         lines.append("🖥️ " + "  ·  ".join(platforms))
-    if status:
-        lines.append(status)
+    detail = status
+    if release_date:
+        detail += f"  ·  📅 {release_date}"
+    if detail:
+        lines.append(detail)
     if video_url:
         lines.append(f"🎬 [Trailer]({video_url})")
     if summary:
@@ -1355,8 +1362,9 @@ async def _do_save_game(chat_id: int, pending: dict, message_id: int | None = No
             "developer":  pending.get("developer", ""),
             "genres":     pending.get("genres", []),
             "platforms":  pending.get("platforms", []),
-            "status":     pending.get("status", "Out"),
-            "hype":       pending.get("hype", ""),
+            "status":       pending.get("status", "Out"),
+            "release_date": pending.get("release_date", ""),
+            "hype":         pending.get("hype", ""),
         })
     except Exception as e:
         msg = f"❌ Failed to save: {e}"
@@ -2506,4 +2514,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-video"}
+    return {"ok": True, "v": "game-video-2"}
