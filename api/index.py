@@ -25,6 +25,10 @@ NOTION_DB = {
 
 NOTION_DB_LOGS        = os.environ.get("NOTION_DB_LOGS", "")
 NOTION_DB_TRIP_PLACES = os.environ.get("NOTION_DB_TRIP_PLACES", "")
+NOTION_DB_GAME        = os.environ.get("NOTION_DB_GAME", "")
+
+if NOTION_DB_GAME:
+    NOTION_DB["game"] = NOTION_DB_GAME
 
 CATEGORY_EMOJI = {
     "location": "📍",
@@ -32,6 +36,7 @@ CATEGORY_EMOJI = {
     "article":  "📖",
     "video":    "🎬",
     "recipe":   "🍳",
+    "game":     "🎮",
     "other":    "📌",
 }
 
@@ -450,7 +455,8 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
         f"If web info is empty or has no reviews, write a factual one-line description only — NEVER invent ratings, visitor quotes, or review summaries.\n"
         f"5. For ALL fields: if data is unavailable, use an empty string \"\". NEVER write 'not found', 'unknown', 'not specified', 'not available', 'N/A', or any similar phrase.\n"
         f"5. Generate a maps_link: Google Maps search URL for the place.\n\n"
-        f"Categories: location, product, article, video, recipe, other\n\n"
+        f"Categories: location, product, article, video, recipe, game, other\n"
+        f"Use category=game for video game store pages, game trailers, or game-related links.\n\n"
         f"Return ONLY valid JSON, no markdown:\n"
         f'{{"category":"...","name":"exact venue/dish/product name","location":"neighbourhood, city, country","type":"e.g. Beach bar, Sushi restaurant, Boutique hotel","vibe":"2-3 adjectives","best_for":"e.g. sunset drinks, families, solo travelers","summary":"3-5 sentences: what makes it special, atmosphere, must-tries, and what reviews/visitors say about it","rating":"score if found in web info, else empty string","maps_link":"https://www.google.com/maps/search/Name+City","search_terms":["term1","term2"]}}'
     )
@@ -964,6 +970,239 @@ async def notion_find_bucket_list() -> str | None:
     return None
 
 
+# ── Game DB helpers ───────────────────────────────────────────────────────────
+
+_GAME_URL_RE = re.compile(
+    r'(store\.steampowered\.com|gog\.com/game|epicgames\.com|itch\.io'
+    r'|nintendo\.com/store|playstation\.com/[a-z-]+/games|xbox\.com/[a-z-]+/games)',
+    re.IGNORECASE,
+)
+
+def _is_game_url(url: str) -> bool:
+    return bool(_GAME_URL_RE.search(url))
+
+_GAME_GENRE_MAP: dict[str, str] = {
+    "roguelite": "Roguelite", "rogue-lite": "Roguelite",
+    "roguelike": "Roguelike", "rogue-like": "Roguelike",
+    "deckbuilder": "Deckbuilder", "deck builder": "Deckbuilder",
+    "deck-builder": "Deckbuilder", "deckbuilding": "Deckbuilder",
+    "metroidvania": "Metroidvania",
+    "action": "Action", "action-adventure": "Action", "action adventure": "Action",
+    "platformer": "Platformer", "platform": "Platformer",
+    "survivors-like": "Survivors-like", "survivors like": "Survivors-like",
+    "survivor": "Survivors-like", "bullet heaven": "Survivors-like",
+    "strategy": "Strategy", "turn-based": "Strategy", "rts": "Strategy",
+    "rpg": "RPG", "role-playing": "RPG", "role playing": "RPG",
+}
+_VALID_GAME_GENRES = frozenset({"Roguelite", "Roguelike", "Deckbuilder", "Metroidvania",
+                                 "Action", "Platformer", "Survivors-like", "Strategy", "RPG"})
+
+_GAME_PLATFORM_MAP: dict[str, str] = {
+    "steam deck": "Steam Deck",
+    "pc": "PC", "windows": "PC", "mac": "PC", "linux": "PC", "steam": "PC",
+    "switch": "Switch", "nintendo switch": "Switch", "nintendo": "Switch",
+    "ps5": "PS5", "playstation 5": "PS5", "playstation": "PS5",
+    "xbox": "Xbox", "xbox series": "Xbox",
+}
+_VALID_GAME_PLATFORMS = frozenset({"PC", "Switch", "PS5", "Xbox", "Steam Deck"})
+
+
+def _map_game_genres(raw: list) -> list:
+    """Map a list of raw genre strings to valid DB multi-select options."""
+    result: list = []
+    seen: set = set()
+    for item in raw:
+        s = str(item).strip()
+        if s in _VALID_GAME_GENRES and s not in seen:
+            result.append(s); seen.add(s); continue
+        lower = s.lower()
+        # longest-first so "rogue-lite" beats "rogue"
+        for k in sorted(_GAME_GENRE_MAP, key=len, reverse=True):
+            if k in lower:
+                v = _GAME_GENRE_MAP[k]
+                if v not in seen:
+                    result.append(v); seen.add(v)
+                break
+    return result
+
+
+def _map_game_platforms(raw: list) -> list:
+    """Map a list of raw platform strings to valid DB multi-select options."""
+    result: list = []
+    seen: set = set()
+    for item in raw:
+        s = str(item).strip()
+        if s in _VALID_GAME_PLATFORMS and s not in seen:
+            result.append(s); seen.add(s); continue
+        lower = s.lower()
+        # longest-first so "steam deck" beats "steam"
+        for k in sorted(_GAME_PLATFORM_MAP, key=len, reverse=True):
+            if k in lower:
+                v = _GAME_PLATFORM_MAP[k]
+                if v not in seen:
+                    result.append(v); seen.add(v)
+                break
+    return result
+
+
+async def analyse_game_link(url: str, meta: dict) -> dict:
+    """Extract structured game data from a URL using page metadata + Groq knowledge."""
+    title = meta.get("title", "")
+    desc  = meta.get("desc", "")
+    prompt = (
+        f"Extract game details from this URL and metadata. Use your knowledge of the game if you recognise it.\n"
+        f"URL: {url}\n"
+        f"Title: {title}\n"
+        f"Description: {desc[:500]}\n\n"
+        f"Return ONLY valid JSON — use empty string for unknown fields, never 'unknown' or 'N/A':\n"
+        f'{{"name":"exact game name","developer":"studio name or empty",'
+        f'"genres":["genre1"],"platforms":["platform1"],'
+        f'"release_date":"YYYY-MM-DD or empty","status":"Unreleased or Out",'
+        f'"summary":"1-2 sentences describing the game"}}\n\n'
+        f"Genres — use only these exact values (pick all that apply): "
+        f"Roguelite, Roguelike, Deckbuilder, Metroidvania, Action, Platformer, Survivors-like, Strategy, RPG\n"
+        f"Platforms — use only these exact values: PC, Switch, PS5, Xbox, Steam Deck\n"
+        f"Status: 'Unreleased' if not yet released, 'Out' if already out."
+    )
+    raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=400)
+    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
+    raw = re.sub(r"```$", "", raw.strip())
+    return json.loads(_extract_json(raw))
+
+
+async def save_game_to_notion(game: dict) -> str:
+    """Insert a row into the 'To Play' game database."""
+    props: dict = {
+        "Name": {"title": [{"text": {"content": (game.get("name") or "")[:200]}}]},
+    }
+    if game.get("url"):
+        props["Review"] = {"url": game["url"]}
+    if game.get("developer"):
+        props["Developer"] = {"rich_text": _rich_text(game["developer"])}
+    genres = game.get("genres") or []
+    if genres:
+        props["Genre"] = {"multi_select": [{"name": g} for g in genres]}
+    platforms = game.get("platforms") or []
+    if platforms:
+        props["Platform"] = {"multi_select": [{"name": p} for p in platforms]}
+    if game.get("status") in ("Unreleased", "Out", "Playing", "Finished"):
+        props["Status"] = {"select": {"name": game["status"]}}
+    if game.get("hype") in ("★★★", "★★", "★"):
+        props["Hype"] = {"select": {"name": game["hype"]}}
+    if game.get("release_date"):
+        props["Release Date"] = {"date": {"start": game["release_date"]}}
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.post(
+            "https://api.notion.com/v1/pages",
+            headers=NOTION_HEADERS,
+            json={"parent": {"database_id": NOTION_DB_GAME}, "properties": props},
+        )
+    r.raise_for_status()
+    return r.json()["url"]
+
+
+async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
+    """Analyse a game URL and present a confirmation card for the To Play DB."""
+    if not NOTION_DB_GAME:
+        await tg_send(chat_id,
+            "⚠️ Game database not configured. Add NOTION_DB_GAME env var and redeploy.")
+        return
+
+    try:
+        game_data = await analyse_game_link(url, meta)
+    except Exception as e:
+        await tg_send(chat_id, f"❌ Game analysis failed: {e}")
+        return
+
+    name       = _clean_field(game_data.get("name", "")) or meta.get("title", "") or url
+    developer  = _clean_field(game_data.get("developer", ""))
+    genres     = _map_game_genres(game_data.get("genres") or [])
+    platforms  = _map_game_platforms(game_data.get("platforms") or [])
+    status     = game_data.get("status", "Out")
+    if status not in ("Unreleased", "Out", "Playing", "Finished"):
+        status = "Out"
+    release_date = _clean_field(game_data.get("release_date", ""))
+    summary      = game_data.get("summary", "")
+    if note:
+        summary = note + (" — " + summary if summary else "")
+
+    pid = str(uuid.uuid4())[:8]
+    PENDING[pid] = {
+        "action":       "save_link",
+        "chat_id":      chat_id,
+        "url":          url,
+        "name":         name[:200],
+        "category":     "game",
+        "notes":        summary,
+        "forced":       None,
+        "ai_category":  "game",
+        "related_pages": [],
+        "developer":    developer,
+        "genres":       genres,
+        "platforms":    platforms,
+        "status":       status,
+        "release_date": release_date,
+    }
+
+    lines = [f"🎮 *{name}*"]
+    if developer:
+        lines.append(f"👨‍💻 {developer}")
+    if genres:
+        lines.append("🏷️ " + "  ·  ".join(genres))
+    if platforms:
+        lines.append("🖥️ " + "  ·  ".join(platforms))
+    detail_parts = []
+    if status:
+        detail_parts.append(status)
+    if release_date:
+        detail_parts.append(f"📅 {release_date}")
+    if detail_parts:
+        lines.append("  ".join(detail_parts))
+    if summary:
+        lines.append(f"\n{summary}")
+    lines.append("\n🎮 Save to *To Play* list?")
+
+    keyboard = [[
+        {"text": "✅ Save to To Play", "callback_data": f"save:{pid}"},
+        {"text": "❌ Cancel",          "callback_data": f"cancel:{pid}"},
+    ]]
+    await tg_send_buttons(chat_id, "\n".join(lines), keyboard)
+
+
+async def _do_save_game(chat_id: int, pending: dict, message_id: int | None = None):
+    """Persist a game pending entry to the To Play Notion DB."""
+    try:
+        notion_url = await save_game_to_notion({
+            "name":         pending["name"],
+            "url":          pending["url"],
+            "developer":    pending.get("developer", ""),
+            "genres":       pending.get("genres", []),
+            "platforms":    pending.get("platforms", []),
+            "status":       pending.get("status", "Out"),
+            "release_date": pending.get("release_date", ""),
+        })
+    except Exception as e:
+        msg = f"❌ Failed to save: {e}"
+        if message_id:
+            await tg_edit_buttons(chat_id, message_id, msg)
+        else:
+            await tg_send(chat_id, msg)
+        return
+
+    reply = f"🎮 *Saved to To Play*\n*{pending['name']}*"
+    if pending.get("developer"):
+        reply += f"\n👨‍💻 {pending['developer']}"
+    if pending.get("genres"):
+        reply += "\n🏷️ " + "  ·  ".join(pending["genres"])
+    reply += f"\n\n[Open in Notion]({notion_url})"
+
+    if message_id:
+        await tg_edit_buttons(chat_id, message_id, reply)
+    else:
+        await tg_send(chat_id, reply)
+
+
 async def trip_places_add(pending: dict, trip_name: str) -> str:
     """Add a place to the Trip Places database."""
     if not NOTION_DB_TRIP_PLACES:
@@ -1173,6 +1412,11 @@ async def handle_save_link(chat_id: int, url: str, note: str):
 
     meta = await fetch_page_meta(url)
 
+    # Fast path: known game store URL or !game force → game flow
+    if _is_game_url(url) or forced_category == "game":
+        await handle_save_game_link(chat_id, url, clean_note, meta)
+        return
+
     try:
         result = await notion_analyse_link(url, clean_note, meta)
     except Exception as e:
@@ -1183,6 +1427,11 @@ async def handle_save_link(chat_id: int, url: str, note: str):
     category = forced_category or ai_category
     if category not in NOTION_DB:
         category = "other"
+
+    # Groq classified as game → branch to game flow
+    if category == "game":
+        await handle_save_game_link(chat_id, url, clean_note, meta)
+        return
 
     name      = result.get("name", meta.get("title", ""))[:200] or url
     location  = _clean_field(result.get("location", ""))
@@ -1265,6 +1514,10 @@ async def handle_save_link(chat_id: int, url: str, note: str):
 
 
 async def _do_save_link(chat_id: int, pending: dict, message_id: int | None = None):
+    if pending.get("category") == "game":
+        await _do_save_game(chat_id, pending, message_id)
+        return
+
     url      = pending["url"]
     category = pending["category"]
     name     = pending["name"]
@@ -1456,7 +1709,7 @@ async def handle_pending_modification(chat_id: int, text: str, pid: str, pending
             f"'put it under Japan trip', 'store this in Tokyo'. Set page to the topic name (no 'my' or 'list').\n"
             f"- cancel: user wants to cancel\n"
             f"- modify: user wants to change something — update only the mentioned fields, keep others unchanged\n"
-            f"Valid categories: location, product, article, video, recipe, other"
+            f"Valid categories: location, product, article, video, recipe, game, other"
         )
         try:
             raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=200)
@@ -2063,4 +2316,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "addto-regex"}
+    return {"ok": True, "v": "game-db"}

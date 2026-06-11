@@ -11,6 +11,9 @@ from api.index import (
     _clean_topic_name,
     _detect_addto_intent,
     _map_type,
+    _map_game_genres,
+    _map_game_platforms,
+    _is_game_url,
     parse_command,
     _rich_text,
     NOTION_DB,
@@ -253,3 +256,77 @@ class TestMapTypeNewTypes:
 def test_all_categories_have_emoji():
     for cat in NOTION_DB:
         assert cat in CATEGORY_EMOJI, f"Missing emoji for category: {cat}"
+
+
+# ── _map_game_genres ──────────────────────────────────────────────────────────
+
+class TestMapGameGenres:
+    @pytest.mark.parametrize("raw,expected", [
+        (["Action"],                  ["Action"]),
+        (["RPG"],                     ["RPG"]),
+        (["Roguelite"],               ["Roguelite"]),
+        (["roguelike"],               ["Roguelike"]),
+        (["deckbuilder"],             ["Deckbuilder"]),
+        (["deck builder"],            ["Deckbuilder"]),
+        (["metroidvania"],            ["Metroidvania"]),
+        (["platformer"],              ["Platformer"]),
+        (["survivors-like"],          ["Survivors-like"]),
+        (["survivor"],                ["Survivors-like"]),
+        (["strategy"],                ["Strategy"]),
+        (["role-playing"],            ["RPG"]),
+        (["Action", "RPG"],           ["Action", "RPG"]),
+        (["unknown genre"],           []),
+        ([],                          []),
+        (["Action", "action"],        ["Action"]),    # dedup
+    ])
+    def test_mapping(self, raw, expected):
+        assert _map_game_genres(raw) == expected
+
+
+# ── _map_game_platforms ───────────────────────────────────────────────────────
+
+class TestMapGamePlatforms:
+    @pytest.mark.parametrize("raw,expected", [
+        (["PC"],                      ["PC"]),
+        (["pc"],                      ["PC"]),
+        (["windows"],                 ["PC"]),
+        (["steam"],                   ["PC"]),
+        (["Steam Deck"],              ["Steam Deck"]),
+        (["steam deck"],              ["Steam Deck"]),
+        (["Switch"],                  ["Switch"]),
+        (["nintendo switch"],         ["Switch"]),
+        (["PS5"],                     ["PS5"]),
+        (["playstation 5"],           ["PS5"]),
+        (["Xbox"],                    ["Xbox"]),
+        (["xbox series"],             ["Xbox"]),
+        (["PC", "Switch", "PS5"],     ["PC", "Switch", "PS5"]),
+        (["unknown platform"],        []),
+        ([],                          []),
+        # single string containing "steam deck" must prefer Steam Deck over PC
+        (["steam deck"],              ["Steam Deck"]),
+    ])
+    def test_mapping(self, raw, expected):
+        assert _map_game_platforms(raw) == expected
+
+
+# ── _is_game_url ──────────────────────────────────────────────────────────────
+
+class TestIsGameUrl:
+    @pytest.mark.parametrize("url", [
+        "https://store.steampowered.com/app/1456480/Hades_II/",
+        "https://www.gog.com/game/disco_elysium",
+        "https://store.epicgames.com/en-US/p/hades-2",
+        "https://itch.io/games",
+        "https://www.nintendo.com/store/products/hollow-knight",
+    ])
+    def test_game_urls(self, url):
+        assert _is_game_url(url) is True
+
+    @pytest.mark.parametrize("url", [
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "https://www.amazon.com/dp/B08N5WRWNW",
+        "https://maps.google.com/place/foo",
+        "https://github.com/anthropics/claude-code",
+    ])
+    def test_non_game_urls(self, url):
+        assert _is_game_url(url) is False
