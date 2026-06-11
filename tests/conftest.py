@@ -15,6 +15,7 @@ _ENV_STUBS = {
     "NOTION_DB_VIDEO":     "vid-db-id",
     "NOTION_DB_RECIPE":    "rec-db-id",
     "NOTION_DB_OTHER":     "oth-db-id",
+    "NOTION_DB_GAME":      "game-db-id",
 }
 
 for k, v in _ENV_STUBS.items():
