@@ -2538,7 +2538,7 @@ async def health():
 
 @app.get("/api/igdb-test")
 async def igdb_test(url: str = "", name: str = "Forza Horizon 6"):
-    """Debug endpoint: fetch meta for url, run full analyse_game_link, show result."""
+    """Debug endpoint: show IGDB result + Notion DB schema."""
     try:
         meta = {}
         if url:
@@ -2546,11 +2546,25 @@ async def igdb_test(url: str = "", name: str = "Forza Horizon 6"):
             name = meta.get("title", name)
         igdb_result = await igdb_search_game(name)
         analysed    = await analyse_game_link(url or f"https://store.steampowered.com/app/0/{name}/", meta or {"title": name})
+
+        # Fetch the actual Notion DB schema
+        notion_schema = {}
+        if NOTION_DB_GAME:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    f"https://api.notion.com/v1/databases/{NOTION_DB_GAME}",
+                    headers=NOTION_HEADERS,
+                )
+            if r.status_code == 200:
+                notion_schema = {k: v["type"] for k, v in r.json().get("properties", {}).items()}
+            else:
+                notion_schema = {"error": r.status_code, "body": r.text}
+
         return {
-            "meta_title": name,
-            "meta":       meta,
-            "igdb_raw":   igdb_result,
-            "analysed":   analysed,
+            "meta_title":    name,
+            "igdb_raw":      igdb_result,
+            "analysed":      analysed,
+            "notion_schema": notion_schema,
         }
     except Exception as e:
         import traceback
