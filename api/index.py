@@ -1359,7 +1359,9 @@ def _extract_store_release_date(content: str) -> tuple[str, str]:
     """
     if not content:
         return "", ""
-    m = re.search(r'Release\s*Date\s*[:\s]\s*\**\s*([^\n|*<]{3,40})', content, re.IGNORECASE)
+    # Handles "Release Date: 6 May 2024", "**Release Date:** ...", and table rows
+    # like "| Release Date | May 12, 2023 |".
+    m = re.search(r'Release\s*Date[\s:|]+\**\s*([^\n|*<]{3,40})', content, re.IGNORECASE)
     if not m:
         return "", ""
     raw = m.group(1).strip().rstrip(".,")
