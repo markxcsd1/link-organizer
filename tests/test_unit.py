@@ -17,6 +17,8 @@ from api.index import (
     _is_generic_title,
     _extract_store_release_date,
     _select_igdb_release,
+    _safe_json_loads,
+    _looks_like_game,
     parse_command,
     _rich_text,
     NOTION_DB,
@@ -486,3 +488,45 @@ class TestSelectIgdbRelease:
                 {"category": 0, "date": _ts(2022, 2, 1), "region": 8, "human": "x"}]}
         iso, _, _ = _select_igdb_release(game)
         assert iso == "2022-02-01"
+
+
+# ── _safe_json_loads ──────────────────────────────────────────────────────────
+
+class TestSafeJsonLoads:
+    def test_valid(self):
+        assert _safe_json_loads('{"a": 1}') == {"a": 1}
+
+    def test_prefix_and_suffix_text(self):
+        assert _safe_json_loads('Sure: {"category": "game", "name": "Hades II"} done') == \
+            {"category": "game", "name": "Hades II"}
+
+    def test_trailing_comma_repaired(self):
+        assert _safe_json_loads('{"a": 1, "b": 2,}') == {"a": 1, "b": 2}
+
+    def test_unrecoverable_returns_none(self):
+        # Unescaped inner double-quotes — the failure mode that crashed a save.
+        assert _safe_json_loads('{"summary": "he said "hi" to everyone"}') is None
+
+    def test_no_json_returns_none(self):
+        assert _safe_json_loads("no json at all") is None
+
+
+# ── _looks_like_game ──────────────────────────────────────────────────────────
+
+class TestLooksLikeGame:
+    @pytest.mark.parametrize("text", [
+        "Hades II - Official Gameplay Trailer",
+        "Hollow Knight: Silksong — coming to Nintendo Switch",
+        "Now in Early Access on Steam",
+        "A roguelike deckbuilder",
+    ])
+    def test_positive(self, text):
+        assert _looks_like_game(text) is True
+
+    @pytest.mark.parametrize("text", [
+        "Best pasta recipe in Rome",
+        "How to fix a leaky faucet",
+        "",
+    ])
+    def test_negative(self, text):
+        assert _looks_like_game(text) is False

@@ -126,6 +126,40 @@ def _extract_json(text: str) -> str:
                 return text[start:i + 1]
     return text[start:]
 
+
+def _strip_fences(text: str) -> str:
+    """Strip ```json … ``` markdown fences an LLM may wrap its output in."""
+    text = re.sub(r"^```[a-z]*\n?", "", text.strip(), flags=re.IGNORECASE)
+    return re.sub(r"```$", "", text.strip())
+
+
+def _safe_json_loads(raw: str):
+    """
+    Best-effort parse of possibly-malformed LLM JSON. Tries the raw object, then
+    a couple of cheap repairs (trailing commas, raw newlines in strings).
+    Returns the parsed object, or None if unrecoverable.
+    """
+    candidate = _extract_json(raw)
+    for attempt in (
+        candidate,
+        re.sub(r',\s*([}\]])', r'\1', candidate),     # trailing commas before } or ]
+        re.sub(r'(?<!\\)\n', ' ', candidate),          # literal newlines inside strings
+    ):
+        try:
+            return json.loads(attempt)
+        except Exception:
+            continue
+    return None
+
+
+def _looks_like_game(text: str) -> bool:
+    """Cheap heuristic used only as a last resort when JSON parsing fails entirely."""
+    return bool(re.search(
+        r'\b(gameplay|launch trailer|reveal trailer|video ?game|early access|wishlist|'
+        r'roguelite|roguelike|metroidvania|boss fight|nintendo switch|playstation|xbox|steam)\b',
+        text or "", re.IGNORECASE))
+
+
 def parse_command(note: str) -> tuple:
     note = note.strip()
     if note.startswith("!"):
@@ -583,9 +617,23 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
         f'{{"category":"...","name":"exact venue/dish/product name","location":"neighbourhood, city, country","type":"e.g. Beach bar, Sushi restaurant, Boutique hotel","vibe":"2-3 adjectives","best_for":"e.g. sunset drinks, families, solo travelers","summary":"3-5 sentences: what makes it special, atmosphere, must-tries, and what reviews/visitors say about it","rating":"score if found in web info, else empty string","maps_link":"https://www.google.com/maps/search/Name+City","search_terms":["term1","term2"]}}'
     )
     raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=700)
-    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
-    raw = re.sub(r"```$", "", raw.strip())
-    return json.loads(_extract_json(raw))
+    parsed = _safe_json_loads(_strip_fences(raw))
+    if parsed is None:
+        # One stricter retry — LLMs usually emit clean JSON the second time.
+        strict = prompt + (
+            "\n\nReturn ONLY valid minified JSON on a single line. Escape every "
+            'double-quote inside a string value as \\". No line breaks inside strings.')
+        raw = await groq_chat([{"role": "user", "content": strict}], max_tokens=700)
+        parsed = _safe_json_loads(_strip_fences(raw))
+    if parsed is None:
+        # Last resort: keep the save alive with a minimal, correctly-routed result.
+        print(f"[analyse] JSON unrecoverable, using fallback for {url!r}")
+        parsed = {
+            "category": "game" if _looks_like_game(f"{title} {desc} {url}") else "other",
+            "name":     title or url,
+            "summary":  desc[:300],
+        }
+    return parsed
 
 async def notion_save_page(db_id: str, properties: dict) -> str:
     async with httpx.AsyncClient(timeout=15) as client:
@@ -1412,9 +1460,7 @@ async def _groq_game_fallback(url: str, title: str, desc: str) -> dict:
         f"Status: 'Unreleased' if not yet released, 'Out' if already out."
     )
     raw = await groq_chat([{"role": "user", "content": prompt}], max_tokens=400)
-    raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
-    raw = re.sub(r"```$", "", raw.strip())
-    result = json.loads(_extract_json(raw))
+    result = _safe_json_loads(_strip_fences(raw)) or {"name": title}
     result["genres"]    = _map_game_genres(result.get("genres") or [])
     result["platforms"] = _map_game_platforms(result.get("platforms") or [])
     # Treat Groq's date as approximate only — never write a precise day we can't verify.
@@ -2830,4 +2876,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-pipeline-1"}
+    return {"ok": True, "v": "game-pipeline-2"}
