@@ -19,6 +19,25 @@ iOS Share Sheet → Vercel API → Groq (Llama 3.1 8B) classification → Notion
 - Trip DBs (e.g. "⛵ Sifnos — Jul 17–20") may live under any parent page (the user has them under "☀️ Summer 2026"); they are NOT moved into Bucket list automatically.
 - Working-state checkpoint: tag `v1-chat-works` at the commit where chat answers ferry/itinerary questions reliably.
 
+## Game pipeline (To Play DB)
+
+Game saves work backward from whatever the user shares — usually a **trailer (YouTube) or a review**, sometimes a store page:
+
+1. `fetch_page_meta` reads the link (Jina-backed, see below) → raw title.
+2. `igdb_search_game` resolves the canonical game and returns genre/developer/platform, the store URL (IGDB `websites`), and structured `release_dates`. **IGDB is NOT trusted for the release date** — its `first_release_date` back-fills a placeholder day for year/quarter/TBD entries. `_select_igdb_release` only yields an exact date for IGDB "exact" (category 0) entries.
+3. The **store page** (located via IGDB `websites`, else a DuckDuckGo search in `_find_store_url`) is read through Jina and parsed by `_extract_store_release_date` — this is the authoritative date source.
+4. Date precedence: **store exact > IGDB exact > approximate `human` text** (never fabricate a precise day; `Status` becomes Unreleased). Trailer/review/store are routed to the `Video`/`Review`/`Store` URL fields by input type; the missing one is auto-found (`find_game_trailer`).
+
+The To Play DB has a `Store` URL property (added June 2026) alongside Review/Video.
+
+## External services (why each is unavoidable)
+
+Per the "minimize external services" principle, each non-core service earns its place:
+
+- **Jina Reader** (`r.jina.ai`, free, optional `JINA_API_KEY`): the only way to get real titles + store release dates from JS-rendered pages (Xbox/Nintendo/PlayStation/Instagram/TikTok) that a plain `httpx` GET returns a shell for. Used as a *fallback* in `fetch_page_meta` — fast path is unchanged. A drop-in HTTP call, not a platform dependency.
+- **IGDB** (free via Twitch): authoritative genre/developer/platform + store-URL resolution. Not used for dates.
+- **Apify** (optional, free $5/mo, `APIFY_TOKEN`): Google Maps Scraper for accurate location ratings/reviews where DuckDuckGo scraping is unreliable. Strictly additive — `apify_maps_lookup` returns `{}` when the token is unset or the run is slow, falling back to `web_search`. **Google Places was rejected** (requires billing); Apify's free tier needs no card. Bounded to an 18s timeout; `vercel.json` raises `maxDuration` to 60s.
+
 ## Development Commands
 
 ```bash
