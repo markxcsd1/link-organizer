@@ -19,6 +19,7 @@ from api.index import (
     _select_igdb_release,
     _safe_json_loads,
     _looks_like_game,
+    _clean_game_title,
     parse_command,
     _rich_text,
     NOTION_DB,
@@ -530,3 +531,21 @@ class TestLooksLikeGame:
     ])
     def test_negative(self, text):
         assert _looks_like_game(text) is False
+
+
+# ── _clean_game_title ─────────────────────────────────────────────────────────
+
+class TestCleanGameTitle:
+    @pytest.mark.parametrize("raw,expected", [
+        ("The Last Salvage Squad Trailer",            "The Last Salvage Squad"),
+        ("Hades II - Official Launch Trailer",        "Hades II"),
+        ("Elden Ring Gameplay Reveal | IGN",          "Elden Ring"),
+        ("Cyberpunk 2077 - Official Cinematic Trailer","Cyberpunk 2077"),
+        ("Baldur's Gate 3 — Launch Trailer",          "Baldur's Gate 3"),
+        # Must NOT over-strip real titles that merely contain a colon/dash:
+        ("Hollow Knight: Silksong",                   "Hollow Knight: Silksong"),
+        ("The Last of Us Part II",                    "The Last of Us Part II"),
+        ("Hades II",                                  "Hades II"),
+    ])
+    def test_clean(self, raw, expected):
+        assert _clean_game_title(raw) == expected
