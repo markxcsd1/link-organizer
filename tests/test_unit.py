@@ -20,6 +20,8 @@ from api.index import (
     _safe_json_loads,
     _looks_like_game,
     _clean_game_title,
+    _parse_exact_date,
+    _clean_video_url,
     parse_command,
     _rich_text,
     NOTION_DB,
@@ -549,3 +551,41 @@ class TestCleanGameTitle:
     ])
     def test_clean(self, raw, expected):
         assert _clean_game_title(raw) == expected
+
+
+# ── _parse_exact_date ─────────────────────────────────────────────────────────
+
+class TestParseExactDate:
+    @pytest.mark.parametrize("raw,iso", [
+        ("Jun 17, 2026",  "2026-06-17"),
+        ("June 17, 2026", "2026-06-17"),
+        ("17 Jun 2026",   "2026-06-17"),
+        ("2026-06-17",    "2026-06-17"),
+        ("6 May, 2024",   "2024-05-06"),
+    ])
+    def test_full_dates(self, raw, iso):
+        assert _parse_exact_date(raw) == iso
+
+    @pytest.mark.parametrize("raw", [
+        "2026", "Jun 2026", "Q1 2026", "Coming soon", "To be announced", "", "TBA",
+    ])
+    def test_approximate_returns_empty(self, raw):
+        assert _parse_exact_date(raw) == ""
+
+
+# ── _clean_video_url ──────────────────────────────────────────────────────────
+
+class TestCleanVideoUrl:
+    @pytest.mark.parametrize("raw,expected", [
+        ("https://www.youtube.com/watch?v=GzKT3pIkVmo&list=WL&index=1&pp=iAQBsAgC",
+         "https://www.youtube.com/watch?v=GzKT3pIkVmo"),
+        ("https://youtu.be/GzKT3pIkVmo?si=abc",
+         "https://www.youtube.com/watch?v=GzKT3pIkVmo"),
+        ("https://www.youtube.com/shorts/GzKT3pIkVmo",
+         "https://www.youtube.com/watch?v=GzKT3pIkVmo"),
+    ])
+    def test_normalises_youtube(self, raw, expected):
+        assert _clean_video_url(raw) == expected
+
+    def test_non_youtube_unchanged(self):
+        assert _clean_video_url("https://vimeo.com/123456") == "https://vimeo.com/123456"
