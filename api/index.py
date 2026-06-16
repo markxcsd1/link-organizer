@@ -1160,23 +1160,67 @@ _GAME_GENRE_MAP: dict[str, str] = {
     "deck-builder": "Deckbuilder", "deckbuilding": "Deckbuilder",
     # Metroidvania
     "metroidvania": "Metroidvania",
-    # Action (also covers IGDB "Hack and slash", "Shooter", "Beat 'em up")
-    "action": "Action", "action-adventure": "Action", "action adventure": "Action",
+    # Soulslike (longer keys win, so this beats "action" via length sort)
+    "soulslike": "Soulslike", "souls-like": "Soulslike", "souls like": "Soulslike",
+    "soulsborne": "Soulslike",
+    # Action (IGDB "Hack and slash/Beat 'em up", "Arcade")
+    "action-adventure": "Action", "action adventure": "Action", "action": "Action",
     "hack and slash": "Action", "beat 'em up": "Action", "beat em up": "Action",
-    "shooter": "Action",
-    # Platformer (IGDB uses "Platform")
+    "arcade": "Action",
+    # Shooter (IGDB "Shooter"; FPS/TPS)
+    "first-person shooter": "Shooter", "first person shooter": "Shooter",
+    "third-person shooter": "Shooter", "third person shooter": "Shooter",
+    "shooter": "Shooter", "fps": "Shooter",
+    # Adventure (IGDB "Adventure", "Point-and-click")
+    "point-and-click": "Adventure", "point and click": "Adventure", "adventure": "Adventure",
+    # Platformer (IGDB "Platform")
     "platformer": "Platformer", "platform": "Platformer",
     # Survivors-like
     "survivors-like": "Survivors-like", "survivors like": "Survivors-like",
     "survivor": "Survivors-like", "bullet heaven": "Survivors-like",
-    # Strategy (IGDB uses "Real Time Strategy (RTS)", "Turn-based strategy (TBS)")
-    "strategy": "Strategy", "turn-based": "Strategy", "rts": "Strategy",
+    # Horror / Survival
+    "survival horror": "Horror", "horror": "Horror", "survival": "Survival",
+    # Stealth
+    "stealth": "Stealth",
+    # Racing
+    "racing": "Racing", "racer": "Racing",
+    # Sports
+    "sports": "Sports", "sport": "Sports",
+    # Fighting
+    "fighting": "Fighting", "fighter": "Fighting",
+    # Simulation (IGDB "Simulator"; management/tycoon)
+    "simulation": "Simulation", "simulator": "Simulation",
+    "management": "Simulation", "tycoon": "Simulation",
+    # Puzzle
+    "puzzle": "Puzzle",
+    # Strategy (IGDB "Real Time Strategy (RTS)", "Turn-based strategy (TBS)", "Tactical")
     "real time strategy": "Strategy", "turn-based strategy": "Strategy",
-    # RPG (IGDB uses "Role-playing (RPG)")
-    "rpg": "RPG", "role-playing": "RPG", "role playing": "RPG", "role-playing (rpg)": "RPG",
+    "turn-based": "Strategy", "tactical": "Strategy", "tactics": "Strategy",
+    "strategy": "Strategy", "rts": "Strategy",
+    # Tower Defense
+    "tower defense": "Tower Defense", "tower defence": "Tower Defense",
+    # City Builder
+    "city builder": "City Builder", "city-builder": "City Builder", "citybuilder": "City Builder",
+    # Open World / Sandbox
+    "open world": "Open World", "open-world": "Open World", "sandbox": "Sandbox",
+    # MMO (longest-first keeps "mmorpg" off RPG)
+    "massively multiplayer": "MMO", "mmorpg": "MMO", "mmo": "MMO",
+    # RPG (IGDB "Role-playing (RPG)")
+    "role-playing": "RPG", "role playing": "RPG", "rpg": "RPG",
+    # MOBA / Battle Royale
+    "moba": "MOBA", "battle royale": "Battle Royale",
+    # Visual Novel
+    "visual novel": "Visual Novel",
+    # Rhythm (IGDB "Music")
+    "rhythm": "Rhythm", "music": "Rhythm",
 }
-_VALID_GAME_GENRES = frozenset({"Roguelite", "Roguelike", "Deckbuilder", "Metroidvania",
-                                 "Action", "Platformer", "Survivors-like", "Strategy", "RPG"})
+_VALID_GAME_GENRES = frozenset({
+    "Roguelite", "Roguelike", "Deckbuilder", "Metroidvania", "Action", "Platformer",
+    "Survivors-like", "Strategy", "RPG", "Shooter", "Adventure", "Racing", "Sports",
+    "Fighting", "Simulation", "Puzzle", "Horror", "Survival", "Stealth", "Soulslike",
+    "Open World", "Sandbox", "City Builder", "Tower Defense", "MOBA", "Battle Royale",
+    "MMO", "Visual Novel", "Rhythm",
+})
 
 _GAME_PLATFORM_MAP: dict[str, str] = {
     # Longest keys first to avoid prefix conflicts (sorted at call time, but explicit order helps)
@@ -1535,7 +1579,10 @@ async def _groq_game_fallback(url: str, title: str, desc: str) -> dict:
         f'"release_date":"YYYY or YYYY-MM-DD or empty","status":"Unreleased or Out",'
         f'"summary":"1-2 sentences describing the game"}}\n\n'
         f"Genres — use only these exact values (pick all that apply): "
-        f"Roguelite, Roguelike, Deckbuilder, Metroidvania, Action, Platformer, Survivors-like, Strategy, RPG\n"
+        f"Roguelite, Roguelike, Deckbuilder, Metroidvania, Action, Platformer, Survivors-like, "
+        f"Strategy, RPG, Shooter, Adventure, Racing, Sports, Fighting, Simulation, Puzzle, Horror, "
+        f"Survival, Stealth, Soulslike, Open World, Sandbox, City Builder, Tower Defense, MOBA, "
+        f"Battle Royale, MMO, Visual Novel, Rhythm\n"
         f"Platforms — use only these exact values: PC, Switch, PS5, Xbox, Steam Deck\n"
         f"Status: 'Unreleased' if not yet released, 'Out' if already out."
     )
@@ -3001,4 +3048,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-pipeline-5"}
+    return {"ok": True, "v": "game-pipeline-6"}
