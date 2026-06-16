@@ -403,6 +403,8 @@ class TestExtractStoreReleaseDate:
         ("Release Date: May 12, 2023", "2023-05-12", "May 12"),
         ("Release Date: 5/12/2023",    "2023-05-12", "5/12/2023"),
         ("Release date: 2023-05-12",   "2023-05-12", "2023-05-12"),
+        ("**Release Date:** 6 May, 2024", "2024-05-06", "6 May"),     # markdown bold
+        ("| Release Date | May 12, 2023 |", "2023-05-12", "May 12"),  # table row
     ])
     def test_exact_dates(self, content, iso, human_fragment):
         d, human = _extract_store_release_date(content)
