@@ -1419,6 +1419,21 @@ _STORE_DATE_FORMATS = (
 )
 
 
+def _parse_exact_date(raw: str) -> str:
+    """
+    Return ISO 'YYYY-MM-DD' if `raw` is a full day-month-year date, else ''.
+    A year-only ("2026"), month ("Jun 2026"), or quarter ("Q1 2026") string
+    yields '' — we never fabricate a precise day from an approximate one.
+    """
+    raw = (raw or "").strip().rstrip(".,")
+    for fmt in _STORE_DATE_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return ""
+
+
 def _extract_store_release_date(content: str) -> tuple[str, str]:
     """
     Parse a store page's stated release date out of Jina markdown.
@@ -1433,12 +1448,7 @@ def _extract_store_release_date(content: str) -> tuple[str, str]:
     if not m:
         return "", ""
     raw = m.group(1).strip().rstrip(".,")
-    for fmt in _STORE_DATE_FORMATS:
-        try:
-            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d"), raw
-        except ValueError:
-            continue
-    return "", raw   # not an exact day (e.g. "Coming soon", "Q1 2025", "2025")
+    return _parse_exact_date(raw), raw
 
 
 async def _find_store_url(game_name: str) -> str:
@@ -1543,6 +1553,14 @@ async def analyse_game_link(url: str, meta: dict) -> dict:
     release_date  = store_date or result.get("release_date") or ""
     release_human = store_human or result.get("release_human") or ""
 
+    # Promote a full specific human date (e.g. IGDB "Jun 17, 2026") to an exact
+    # date so it gets saved. Year/quarter/"Coming soon" stay approximate (not a day).
+    if not release_date and release_human:
+        promoted = _parse_exact_date(release_human)
+        if promoted:
+            print(f"[date] promoted human {release_human!r} -> {promoted}")
+            release_date, release_human = promoted, ""
+
     # ── Out vs Unreleased (uses any timestamp, even approximate) ─────────────
     if release_date:
         try:
@@ -1572,6 +1590,12 @@ _VIDEO_URL_RE = re.compile(
 
 def _is_video_url(url: str) -> bool:
     return bool(_VIDEO_URL_RE.search(url))
+
+
+def _clean_video_url(url: str) -> str:
+    """Normalise a YouTube link to just its video id, dropping playlist/index cruft."""
+    m = re.search(r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/shorts/)([A-Za-z0-9_-]{11})', url)
+    return f"https://www.youtube.com/watch?v={m.group(1)}" if m else url
 
 
 async def find_game_trailer(game_name: str) -> str:
@@ -1664,7 +1688,7 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
 
     # Decide which URL is the trailer vs the review, and auto-find the missing one.
     if _is_video_url(url):
-        video_url, review_url = url, ""
+        video_url, review_url = _clean_video_url(url), ""
     elif _is_game_url(url):
         store_url  = store_url or url
         video_url  = await find_game_trailer(name) if name else ""
@@ -1672,6 +1696,7 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
     else:
         review_url = url
         video_url  = await find_game_trailer(name) if name else ""
+    video_url = _clean_video_url(video_url) if video_url else ""
     print(f"[game] store={store_url!r} video={video_url!r} review={review_url!r}")
 
     pid = str(uuid.uuid4())[:8]
@@ -2921,4 +2946,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-pipeline-3"}
+    return {"ok": True, "v": "game-pipeline-4"}
