@@ -1,6 +1,6 @@
 from __future__ import annotations
 import os, json, re, secrets, uuid, asyncio, httpx
-from urllib.parse import unquote_plus, urlparse, unquote
+from urllib.parse import unquote_plus, urlparse, unquote, quote
 from datetime import datetime, timezone, date
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
@@ -1451,8 +1451,31 @@ def _extract_store_release_date(content: str) -> tuple[str, str]:
     return _parse_exact_date(raw), raw
 
 
+def _norm_name(s: str) -> str:
+    """Lowercase alphanumerics only — for loose title matching."""
+    return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+
+
 async def _find_store_url(game_name: str) -> str:
-    """Fallback when IGDB has no website: DuckDuckGo for the Steam store page."""
+    """Find a store page when IGDB has no website. Steam's app-search API first
+    (reliable JSON, no key), then a DuckDuckGo fallback."""
+    # 1. Steam app search.
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                f"https://steamcommunity.com/actions/SearchApps/{quote(game_name)}")
+        if r.status_code == 200:
+            target = _norm_name(game_name)
+            for app in (r.json() or [])[:5]:
+                if not isinstance(app, dict):
+                    continue
+                appid, nm = app.get("appid"), _norm_name(app.get("name", ""))
+                # Accept only a confident match (exact or one contains the other).
+                if appid and nm and (nm == target or target in nm or nm in target):
+                    return f"https://store.steampowered.com/app/{appid}/"
+    except Exception:
+        pass
+    # 2. DuckDuckGo fallback for a Steam store page.
     try:
         async with httpx.AsyncClient(
             timeout=10, follow_redirects=True,
@@ -1461,11 +1484,38 @@ async def _find_store_url(game_name: str) -> str:
         ) as client:
             r = await client.get("https://html.duckduckgo.com/html/",
                                  params={"q": f"{game_name} steam store"})
+        if r.status_code == 200:
+            for m in re.finditer(r'uddg=(https?[^&"\']+)', r.text):
+                decoded = unquote(m.group(1))
+                if "store.steampowered.com/app/" in decoded:
+                    return decoded.split("?")[0]
+    except Exception:
+        pass
+    return ""
+
+
+_REVIEW_DOMAINS = (
+    "ign.com", "gamespot.com", "pcgamer.com", "eurogamer.net", "polygon.com",
+    "rockpapershotgun.com", "metacritic.com", "opencritic.com", "destructoid.com",
+    "gamesradar.com", "pcgamesn.com", "videogameschronicle.com", "gameinformer.com",
+)
+
+
+async def find_game_review(game_name: str) -> str:
+    """DuckDuckGo for a reputable review URL. Returns '' on miss."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=10, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                     "Accept-Language": "en-US,en;q=0.9"},
+        ) as client:
+            r = await client.get("https://html.duckduckgo.com/html/",
+                                 params={"q": f"{game_name} review"})
         if r.status_code != 200:
             return ""
         for m in re.finditer(r'uddg=(https?[^&"\']+)', r.text):
             decoded = unquote(m.group(1))
-            if "store.steampowered.com/app/" in decoded:
+            if any(d in decoded for d in _REVIEW_DOMAINS):
                 return decoded.split("?")[0]
     except Exception:
         pass
@@ -1697,6 +1747,11 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
         review_url = url
         video_url  = await find_game_trailer(name) if name else ""
     video_url = _clean_video_url(video_url) if video_url else ""
+    # Auto-find the pieces we don't already have.
+    if not review_url and name:
+        review_url = await find_game_review(name)
+    if not store_url and name:
+        store_url = await _find_store_url(name)
     print(f"[game] store={store_url!r} video={video_url!r} review={review_url!r}")
 
     pid = str(uuid.uuid4())[:8]
@@ -2946,4 +3001,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-pipeline-4"}
+    return {"ok": True, "v": "game-pipeline-5"}

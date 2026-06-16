@@ -16,6 +16,8 @@ from api.index import (
     fetch_page_meta,
     jina_reader_meta,
     apify_maps_lookup,
+    _find_store_url,
+    find_game_review,
     notion_search,
     notion_query_db_rows,
     insert_into_trip_db,
@@ -491,3 +493,45 @@ class TestApifyMapsLookup:
         respx.post(url__regex=r"https://api\.apify\.com/.*").mock(
             return_value=httpx.Response(200, json=[]))
         assert await apify_maps_lookup("nothing here") == {}
+
+
+# ── _find_store_url (Steam app search) ────────────────────────────────────────
+
+class TestFindStoreUrl:
+    @respx.mock
+    async def test_steam_api_exact_match(self):
+        respx.get(url__regex=r"steamcommunity\.com/actions/SearchApps/").mock(
+            return_value=httpx.Response(200, json=[
+                {"appid": "2483190", "name": "Forza Horizon 6"}]))
+        out = await _find_store_url("Forza Horizon 6")
+        assert out == "https://store.steampowered.com/app/2483190/"
+
+    @respx.mock
+    async def test_steam_mismatch_then_ddg_empty(self):
+        # Steam returns an unrelated game → rejected; DDG fallback finds nothing.
+        respx.get(url__regex=r"steamcommunity\.com/actions/SearchApps/").mock(
+            return_value=httpx.Response(200, json=[
+                {"appid": "1", "name": "Totally Different Game"}]))
+        respx.get(url__regex=r"html\.duckduckgo\.com/html").mock(
+            return_value=httpx.Response(200, text="<html>no results</html>"))
+        assert await _find_store_url("Forza Horizon 6") == ""
+
+
+# ── find_game_review ──────────────────────────────────────────────────────────
+
+class TestFindGameReview:
+    @respx.mock
+    async def test_returns_reputable_domain(self):
+        html = ('<a href="/l/?uddg=https%3A%2F%2Fwww.gamespot.com%2Freviews%2F'
+                'forza-horizon-6-review%2F1900-6418489%2F">GameSpot</a>')
+        respx.get(url__regex=r"html\.duckduckgo\.com/html").mock(
+            return_value=httpx.Response(200, text=html))
+        out = await find_game_review("Forza Horizon 6")
+        assert "gamespot.com" in out
+
+    @respx.mock
+    async def test_skips_unreputable(self):
+        html = '<a href="/l/?uddg=https%3A%2F%2Frandomblog.example%2Fpost">blog</a>'
+        respx.get(url__regex=r"html\.duckduckgo\.com/html").mock(
+            return_value=httpx.Response(200, text=html))
+        assert await find_game_review("Whatever") == ""
