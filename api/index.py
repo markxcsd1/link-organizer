@@ -1283,13 +1283,33 @@ async def _get_igdb_token() -> str:
     return _IGDB_TOKEN
 
 
+def _clean_game_title(title: str) -> str:
+    """
+    Strip trailer/gameplay/store cruft from a page or video title to recover the
+    game name — e.g. 'Hades II - Official Launch Trailer' → 'Hades II',
+    'The Last Salvage Squad Trailer' → 'The Last Salvage Squad'.
+    """
+    t = title or ""
+    # Everything after a separator that introduces trailer/store boilerplate
+    t = re.sub(
+        r'\s*[-|:–—]\s*(official\s+)?[^-|:–—]*?'
+        r'(trailer|gameplay|teaser|reveal|announce\w*|launch|review|walkthrough|dlc|'
+        r'on steam|steam|pc game|out now|available now).*$',
+        '', t, flags=re.IGNORECASE)
+    # Trailing trailer/gameplay keywords even without a separator
+    t = re.sub(r'\s+(official\s+)?(launch|reveal|announcement|cinematic|gameplay|teaser)?\s*trailer\b.*$',
+               '', t, flags=re.IGNORECASE)
+    t = re.sub(r'\s+gameplay\b.*$', '', t, flags=re.IGNORECASE)
+    # Outlet suffixes ("| IGN", "- GameSpot")
+    t = re.sub(r'\s*[\|\-–—]\s*(IGN|GameSpot|Game Informer|Gamescom|PlayStation|Xbox|Nintendo)\b.*$',
+               '', t, flags=re.IGNORECASE)
+    return t.strip(' -|:–—')
+
+
 async def igdb_search_game(name: str) -> dict:
     """Search IGDB for a game by name; return structured dict or {} on miss."""
     token = await _get_igdb_token()
-    clean = re.sub(
-        r'\s*[-|:]\s*(steam|on steam|buy|pc game|review|trailer|gameplay|official).*$',
-        '', name, flags=re.IGNORECASE,
-    ).strip()
+    clean = _clean_game_title(name)
     query = (
         f'search "{clean}"; '
         f'fields name,summary,genres.name,platforms.name,'
@@ -1973,6 +1993,31 @@ async def handle_save_link(chat_id: int, url: str, note: str):
     category = forced_category or ai_category
     if category not in NOTION_DB:
         category = "other"
+
+    # Game rescue: Groq often mislabels a game trailer/teaser as 'video' or 'other'.
+    # A game trailer's description almost always links to a store/wishlist (movie
+    # trailers don't) — that's a strong signal. Otherwise, if the title is
+    # trailer-ish AND IGDB recognises the game, treat it as a game.
+    if category in ("video", "other") and not forced_category:
+        title_desc = f"{meta.get('title','')} {meta.get('desc','')}"
+        strong_store = bool(re.search(
+            r'store\.steampowered\.com|steampowered|/wishlist|wishlist now|wishlist on|'
+            r'playstation\.com|xbox\.com|nintendo\.com/store|epicgames\.com|gog\.com',
+            title_desc, re.IGNORECASE))
+        trailerish = bool(re.search(
+            r'\b(trailer|gameplay|teaser|reveal|launch|demo|early access|wishlist)\b',
+            title_desc, re.IGNORECASE))
+        if strong_store:
+            print("[game-rescue] store/wishlist link in description → reclassified as game")
+            category = "game"
+        elif trailerish and TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET:
+            cand = _clean_game_title(result.get("name") or meta.get("title", ""))
+            try:
+                if cand and (await igdb_search_game(cand)).get("name"):
+                    print(f"[game-rescue] {cand!r} matched IGDB → reclassified as game")
+                    category = "game"
+            except Exception as e:
+                print(f"[game-rescue] failed: {e}")
 
     # Groq classified as game → branch to game flow
     if category == "game":
@@ -2876,4 +2921,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-pipeline-2"}
+    return {"ok": True, "v": "game-pipeline-3"}
