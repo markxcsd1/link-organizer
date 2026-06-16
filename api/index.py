@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os, json, re, secrets, uuid, asyncio, httpx
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urlparse, unquote
+from datetime import datetime, timezone, date
 from fastapi import FastAPI, HTTPException, Header, Request
 from pydantic import BaseModel
 
@@ -28,6 +29,8 @@ NOTION_DB_TRIP_PLACES = os.environ.get("NOTION_DB_TRIP_PLACES", "")
 NOTION_DB_GAME        = os.environ.get("NOTION_DB_GAME", "")
 TWITCH_CLIENT_ID      = os.environ.get("TWITCH_CLIENT_ID", "")
 TWITCH_CLIENT_SECRET  = os.environ.get("TWITCH_CLIENT_SECRET", "")
+JINA_API_KEY          = os.environ.get("JINA_API_KEY", "")      # optional: higher Jina Reader rate limit
+APIFY_TOKEN           = os.environ.get("APIFY_TOKEN", "")       # optional: enables Apify Google Maps ratings
 
 if NOTION_DB_GAME:
     NOTION_DB["game"] = NOTION_DB_GAME
@@ -187,6 +190,52 @@ async def groq_chat(messages: list, max_tokens: int = 512, model: str = "llama-3
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip()
 
+# Page titles that are site headers/boilerplate, not the actual content name
+_GENERIC_TITLE_HINTS = (
+    "official site", "official website", "| xbox", "store | xbox",
+    "playstation store", "nintendo - official", "nintendo store",
+    "epic games store", "- microsoft store", "buy games",
+)
+
+# Hosts that render their content client-side, so a plain fetch returns a shell page
+_JS_HEAVY_HOSTS = (
+    "xbox.com", "nintendo.com", "playstation.com",
+    "instagram.com", "tiktok.com",
+)
+
+
+def _is_generic_title(title: str) -> bool:
+    """True when a page title looks like a site header rather than the content name."""
+    if not title or len(title) > 100:
+        return True
+    tl = title.lower()
+    return any(h in tl for h in _GENERIC_TITLE_HINTS)
+
+
+async def jina_reader_meta(url: str) -> dict:
+    """
+    Render a JS-heavy page through Jina Reader (r.jina.ai) and return
+    {title, desc, content}. Free tier works with no key; optional JINA_API_KEY
+    raises the rate limit. Returns {} on any failure — caller keeps its fast-path data.
+    """
+    headers = {"Accept": "application/json"}
+    if JINA_API_KEY:
+        headers["Authorization"] = f"Bearer {JINA_API_KEY}"
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+            r = await client.get(f"https://r.jina.ai/{url}", headers=headers)
+        if r.status_code != 200:
+            return {}
+        data = r.json().get("data", {}) or {}
+        return {
+            "title":   (data.get("title") or "")[:200],
+            "desc":    (data.get("description") or "")[:600],
+            "content": (data.get("content") or "")[:4000],
+        }
+    except Exception:
+        return {}
+
+
 async def fetch_page_meta(url: str) -> dict:
     """
     Generic metadata fetch — one request, follow all redirects, then:
@@ -280,6 +329,17 @@ async def fetch_page_meta(url: str) -> dict:
         ]:
             m = re.search(pat, html, re.IGNORECASE)
             if m: desc = m.group(1).strip()[:400]; break
+
+    # 3.5 JS-render fallback: if the title still looks like a site header, or the host
+    # renders content client-side, re-read the page through Jina Reader.
+    host = (urlparse(final_url).hostname or "").lower()
+    if _is_generic_title(title) or any(h in host for h in _JS_HEAVY_HOSTS):
+        jina = await jina_reader_meta(final_url)
+        if jina.get("title") and not _is_generic_title(jina["title"]):
+            print(f"[jina] override title {title!r} -> {jina['title']!r}")
+            title = jina["title"]
+        if jina.get("desc") and not desc:
+            desc = jina["desc"]
 
     # 4. Google Maps — extract place name from final URL; discard generic description
     maps_url = ""
@@ -378,6 +438,46 @@ async def web_search(query: str) -> str:
 
     return "\n".join(parts)[:1000]
 
+
+async def apify_maps_lookup(query: str) -> dict:
+    """
+    Apify Google Maps Scraper → structured rating/reviews for one place.
+    Returns {} when APIFY_TOKEN is unset or the run is slow/empty, so the caller
+    transparently falls back to the DuckDuckGo `web_search` path.
+    """
+    if not APIFY_TOKEN:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=18) as client:
+            r = await client.post(
+                "https://api.apify.com/v2/acts/compass~crawler-google-places/run-sync-get-dataset-items",
+                params={"token": APIFY_TOKEN},
+                json={
+                    "searchStringsArray":        [query],
+                    "maxCrawledPlacesPerSearch": 1,
+                    "language":                  "en",
+                },
+            )
+        if r.status_code not in (200, 201):
+            print(f"[apify] status {r.status_code}")
+            return {}
+        items = r.json()
+        if not items:
+            return {}
+        it = items[0]
+        return {
+            "name":          it.get("title", ""),
+            "rating":        it.get("totalScore"),
+            "reviews_count": it.get("reviewsCount"),
+            "address":       it.get("address", ""),
+            "category":      it.get("categoryName", ""),
+            "website":       it.get("website", ""),
+        }
+    except Exception as e:
+        print(f"[apify] lookup failed: {e}")
+        return {}
+
+
 async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
     """Deep analysis: extract the actual subject, do a web lookup for extra details."""
     title = meta.get("title", "")
@@ -417,24 +517,40 @@ async def notion_analyse_link(url: str, note: str, meta: dict) -> dict:
             r'(restaurant|bar|cafe|hotel|beach bar|tavern|bistro|shop|museum)',
             title + " " + desc, re.IGNORECASE))
         search_q = " ".join(filter(None, [candidate, type_words[:30], location_hint])).strip()
-        web_info = await web_search(search_q)
 
-        # Pre-extract any rating found in the snippets so Groq doesn't miss it
-        rating_match = re.search(
-            r'rated?\s+([\d.]+)\s*(?:out of\s*[\d.]+|/\s*[\d.]+|stars?)?'
-            r'|(\d+\.\d)\s*/\s*5'
-            r'|\b([\d.]+)\s+(?:out of|/)\s*5',
-            web_info, re.IGNORECASE)
-        reviews_match = re.search(r'(\d[\d,]+)\s*(?:unbiased\s+)?reviews?', web_info, re.IGNORECASE)
-        source_match  = re.search(r'(tripadvisor|google|yelp|booking|trustpilot)', web_info, re.IGNORECASE)
-        if rating_match:
-            rating_val = next(g for g in rating_match.groups() if g)
-            rating_line = f"Rating: {rating_val}/5"
-            if reviews_match:
-                rating_line += f" ({reviews_match.group(1)} reviews)"
-            if source_match:
-                rating_line += f" — {source_match.group(1).title()}"
-            web_info = rating_line + "\n" + web_info
+        # Prefer Apify Google Maps (structured rating/reviews) when configured;
+        # otherwise fall back to scraping DuckDuckGo snippets.
+        maps_data = await apify_maps_lookup(search_q)
+        if maps_data.get("rating"):
+            rating_line = f"Rating: {maps_data['rating']}/5"
+            if maps_data.get("reviews_count"):
+                rating_line += f" ({maps_data['reviews_count']} reviews)"
+            rating_line += " — Google Maps"
+            extras = [rating_line]
+            if maps_data.get("category"):
+                extras.append(f"Type: {maps_data['category']}")
+            if maps_data.get("address"):
+                extras.append(f"Address: {maps_data['address']}")
+            web_info = "\n".join(extras)
+        else:
+            web_info = await web_search(search_q)
+
+            # Pre-extract any rating found in the snippets so Groq doesn't miss it
+            rating_match = re.search(
+                r'rated?\s+([\d.]+)\s*(?:out of\s*[\d.]+|/\s*[\d.]+|stars?)?'
+                r'|(\d+\.\d)\s*/\s*5'
+                r'|\b([\d.]+)\s+(?:out of|/)\s*5',
+                web_info, re.IGNORECASE)
+            reviews_match = re.search(r'(\d[\d,]+)\s*(?:unbiased\s+)?reviews?', web_info, re.IGNORECASE)
+            source_match  = re.search(r'(tripadvisor|google|yelp|booking|trustpilot)', web_info, re.IGNORECASE)
+            if rating_match:
+                rating_val = next(g for g in rating_match.groups() if g)
+                rating_line = f"Rating: {rating_val}/5"
+                if reviews_match:
+                    rating_line += f" ({reviews_match.group(1)} reviews)"
+                if source_match:
+                    rating_line += f" — {source_match.group(1).title()}"
+                web_info = rating_line + "\n" + web_info
 
     meta_text = ""
     if title:
@@ -1068,6 +1184,35 @@ def _map_game_platforms(raw: list) -> list:
     return result
 
 
+def _select_igdb_release(game: dict) -> tuple[str, str, int | None]:
+    """
+    Pick the best release date from an IGDB game's `release_dates`.
+    Returns (exact_iso, human, ts):
+      - exact_iso: 'YYYY-MM-DD' ONLY when IGDB has an exact (category 0) entry, else ''
+      - human:     the human-readable string of the chosen entry (e.g. 'Q2 2026', '2019')
+      - ts:        a unix timestamp for the Out/Unreleased decision (may be approximate)
+    IGDB's `first_release_date` is only used as a last-resort timestamp — never as an
+    exact date — because it back-fills a placeholder day for year/quarter/TBD entries.
+    """
+    PREF_REGIONS = (8, 2)  # 8 = worldwide, 2 = North America
+    rds = [rd for rd in game.get("release_dates", []) if isinstance(rd, dict)]
+
+    exact = [rd for rd in rds if rd.get("category") == 0 and rd.get("date")]
+    if exact:
+        pref = [rd for rd in exact if rd.get("region") in PREF_REGIONS] or exact
+        chosen = min(pref, key=lambda rd: rd["date"])
+        iso = datetime.fromtimestamp(chosen["date"], tz=timezone.utc).strftime("%Y-%m-%d")
+        return iso, chosen.get("human", "") or "", chosen["date"]
+
+    with_ts = [rd for rd in rds if rd.get("date")]
+    if with_ts:
+        chosen = min(with_ts, key=lambda rd: rd["date"])
+        return "", chosen.get("human", "") or "", chosen["date"]
+
+    frd = game.get("first_release_date")
+    return "", "", frd if frd else None
+
+
 async def _get_igdb_token() -> str:
     """Return a cached IGDB/Twitch app-access token, refreshing when expired."""
     import time
@@ -1101,7 +1246,9 @@ async def igdb_search_game(name: str) -> dict:
         f'search "{clean}"; '
         f'fields name,summary,genres.name,platforms.name,'
         f'involved_companies.company.name,involved_companies.developer,'
-        f'first_release_date; '
+        f'first_release_date,'
+        f'websites.url,websites.category,'
+        f'release_dates.human,release_dates.category,release_dates.date,release_dates.region; '
         f'limit 1;'
     )
     async with httpx.AsyncClient(timeout=10) as client:
@@ -1146,21 +1293,27 @@ async def igdb_search_game(name: str) -> dict:
         p.get("name", "") for p in game.get("platforms", []) if isinstance(p, dict)
     ])
 
-    release_date = ""
-    ts = game.get("first_release_date")
-    if ts:
-        from datetime import datetime, timezone
-        release_date = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+    release_date, release_human, release_ts = _select_igdb_release(game)
 
-    print(f"[igdb] parsed: developer={developer!r} release={release_date!r} "
-          f"genres={genres} platforms={platforms}")
+    # Store/official website (category: 13=Steam, 17=GOG, 16=Epic, 15=itch, 1=official)
+    sites: dict = {}
+    for w in game.get("websites", []):
+        if isinstance(w, dict) and w.get("url"):
+            sites.setdefault(w.get("category"), w["url"])
+    store_url = next((sites[c] for c in (13, 17, 16, 15, 1) if c in sites), "")
+
+    print(f"[igdb] parsed: developer={developer!r} exact_date={release_date!r} "
+          f"human={release_human!r} store={store_url!r} genres={genres} platforms={platforms}")
     return {
-        "name":         game.get("name", clean),
-        "developer":    developer,
-        "genres":       genres,
-        "platforms":    platforms,
-        "release_date": release_date,
-        "summary":      (game.get("summary") or "")[:500],
+        "name":          game.get("name", clean),
+        "developer":     developer,
+        "genres":        genres,
+        "platforms":     platforms,
+        "release_date":  release_date,    # exact ISO only (IGDB category 0); else ""
+        "release_human": release_human,   # approximate text, e.g. "Q2 2026"
+        "release_ts":    release_ts,      # best timestamp for Out/Unreleased decision
+        "store_url":     store_url,
+        "summary":       (game.get("summary") or "")[:500],
     }
 
 
@@ -1191,48 +1344,56 @@ def _game_name_from_url(url: str) -> str:
     return ""
 
 
-async def analyse_game_link(url: str, meta: dict) -> dict:
-    """Extract structured game data. Tries IGDB first; falls back to Groq."""
-    from datetime import date as _date
-    title = meta.get("title", "")
-    desc  = meta.get("desc", "")
+_STORE_DATE_FORMATS = (
+    "%d %b %Y", "%d %B %Y", "%d %b, %Y", "%d %B, %Y",
+    "%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y",
+    "%m/%d/%Y", "%Y-%m-%d", "%d/%m/%Y",
+)
 
-    # If the page title looks generic (not a game name), try the URL slug instead
-    slug = _game_name_from_url(url)
-    _GENERIC_TITLE_HINTS = ("official site", "official website", "| xbox", "store | xbox",
-                             "playstation store", "nintendo store", "epic games store",
-                             "steam", "gog.com", "itch.io")
-    title_lc = title.lower()
-    if slug and (not title or any(h in title_lc for h in _GENERIC_TITLE_HINTS) or len(title) > 100):
-        print(f"[game] generic title {title!r}, using slug {slug!r}")
-        title = slug
 
-    # ── IGDB path ────────────────────────────────────────────────────────────
-    if TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and title:
+def _extract_store_release_date(content: str) -> tuple[str, str]:
+    """
+    Parse a store page's stated release date out of Jina markdown.
+    Returns (exact_iso, human): exact_iso is set only when the store shows a full
+    day; otherwise human holds the raw text ("Coming soon", "Q1 2025", "2025").
+    """
+    if not content:
+        return "", ""
+    m = re.search(r'Release\s*Date\s*[:\s]\s*\**\s*([^\n|*<]{3,40})', content, re.IGNORECASE)
+    if not m:
+        return "", ""
+    raw = m.group(1).strip().rstrip(".,")
+    for fmt in _STORE_DATE_FORMATS:
         try:
-            igdb = await igdb_search_game(title)
-            # If first attempt misses and we haven't tried the slug yet, retry with slug
-            if not igdb.get("name") and slug and slug.lower() != title.lower():
-                print(f"[igdb] miss on {title!r}, retrying with slug {slug!r}")
-                igdb = await igdb_search_game(slug)
-            print(f"[igdb] hit={bool(igdb.get('name'))} name={igdb.get('name','')!r} "
-                  f"release={igdb.get('release_date','')!r} genres={igdb.get('genres')} "
-                  f"platforms={igdb.get('platforms')}")
-            if igdb.get("name"):
-                status = "Out"
-                if igdb.get("release_date"):
-                    try:
-                        rel = _date.fromisoformat(igdb["release_date"])
-                        status = "Unreleased" if rel > _date.today() else "Out"
-                    except ValueError:
-                        pass
-                igdb["status"] = status
-                igdb.setdefault("summary", desc[:300] if desc else "")
-                return igdb
-        except Exception as e:
-            print(f"[igdb] search failed: {e}")
+            return datetime.strptime(raw, fmt).strftime("%Y-%m-%d"), raw
+        except ValueError:
+            continue
+    return "", raw   # not an exact day (e.g. "Coming soon", "Q1 2025", "2025")
 
-    # ── Groq fallback ─────────────────────────────────────────────────────────
+
+async def _find_store_url(game_name: str) -> str:
+    """Fallback when IGDB has no website: DuckDuckGo for the Steam store page."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=10, follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                     "Accept-Language": "en-US,en;q=0.9"},
+        ) as client:
+            r = await client.get("https://html.duckduckgo.com/html/",
+                                 params={"q": f"{game_name} steam store"})
+        if r.status_code != 200:
+            return ""
+        for m in re.finditer(r'uddg=(https?[^&"\']+)', r.text):
+            decoded = unquote(m.group(1))
+            if "store.steampowered.com/app/" in decoded:
+                return decoded.split("?")[0]
+    except Exception:
+        pass
+    return ""
+
+
+async def _groq_game_fallback(url: str, title: str, desc: str) -> dict:
+    """Last-resort extraction when IGDB misses. Groq is NOT trusted for a precise date."""
     prompt = (
         f"Extract game details from this URL and metadata. Use your knowledge of the game if you recognise it.\n"
         f"URL: {url}\n"
@@ -1241,7 +1402,7 @@ async def analyse_game_link(url: str, meta: dict) -> dict:
         f"Return ONLY valid JSON — use empty string for unknown fields, never 'unknown' or 'N/A':\n"
         f'{{"name":"exact game name","developer":"studio name or empty",'
         f'"genres":["genre1"],"platforms":["platform1"],'
-        f'"release_date":"YYYY-MM-DD or empty","status":"Unreleased or Out",'
+        f'"release_date":"YYYY or YYYY-MM-DD or empty","status":"Unreleased or Out",'
         f'"summary":"1-2 sentences describing the game"}}\n\n'
         f"Genres — use only these exact values (pick all that apply): "
         f"Roguelite, Roguelike, Deckbuilder, Metroidvania, Action, Platformer, Survivors-like, Strategy, RPG\n"
@@ -1252,7 +1413,86 @@ async def analyse_game_link(url: str, meta: dict) -> dict:
     raw = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
     raw = re.sub(r"```$", "", raw.strip())
     result = json.loads(_extract_json(raw))
-    # Normalise genres/platforms through the same mappers
+    result["genres"]    = _map_game_genres(result.get("genres") or [])
+    result["platforms"] = _map_game_platforms(result.get("platforms") or [])
+    # Treat Groq's date as approximate only — never write a precise day we can't verify.
+    result["release_human"] = _clean_field(result.get("release_date", ""))
+    result["release_date"]  = ""
+    result["release_ts"]    = None
+    result["store_url"]     = ""
+    return result
+
+
+async def analyse_game_link(url: str, meta: dict) -> dict:
+    """
+    Resolve a game from a trailer / review / store link:
+      title → IGDB (genre/dev/platform + store URL + structured dates)
+      → store page (via Jina) for the authoritative release date.
+    IGDB is never trusted for the precise day; we only write an exact date when the
+    store page or an IGDB exact (category 0) entry provides one.
+    """
+    title = meta.get("title", "")
+    desc  = meta.get("desc", "")
+
+    # If the page title looks like a site header, fall back to the URL slug.
+    slug = _game_name_from_url(url)
+    if slug and _is_generic_title(title):
+        print(f"[game] generic title {title!r}, using slug {slug!r}")
+        title = slug
+
+    # ── Resolve via IGDB (with Groq as last resort) ──────────────────────────
+    igdb: dict = {}
+    if TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and title:
+        try:
+            igdb = await igdb_search_game(title)
+            if not igdb.get("name") and slug and slug.lower() != title.lower():
+                print(f"[igdb] miss on {title!r}, retrying with slug {slug!r}")
+                igdb = await igdb_search_game(slug)
+        except Exception as e:
+            print(f"[igdb] search failed: {e}")
+            igdb = {}
+
+    result = dict(igdb) if igdb.get("name") else await _groq_game_fallback(url, title, desc)
+    name = _clean_field(result.get("name", "")) or title
+
+    # ── Locate the store page ────────────────────────────────────────────────
+    store_url = result.get("store_url") or ""
+    if not store_url and _is_game_url(url):
+        store_url = url                       # the shared link is itself a store page
+    if not store_url and name:
+        store_url = await _find_store_url(name)
+    result["store_url"] = store_url
+
+    # ── Authoritative release date: store page first ─────────────────────────
+    store_date, store_human = "", ""
+    if store_url:
+        jina = await jina_reader_meta(store_url)
+        if jina.get("content"):
+            store_date, store_human = _extract_store_release_date(jina["content"])
+            if store_date or store_human:
+                print(f"[store] {store_url} -> date={store_date!r} human={store_human!r}")
+
+    release_date  = store_date or result.get("release_date") or ""
+    release_human = store_human or result.get("release_human") or ""
+
+    # ── Out vs Unreleased (uses any timestamp, even approximate) ─────────────
+    if release_date:
+        try:
+            status = "Unreleased" if date.fromisoformat(release_date) > date.today() else "Out"
+        except ValueError:
+            status = "Out"
+    elif result.get("release_ts"):
+        status = "Unreleased" if result["release_ts"] > datetime.now(timezone.utc).timestamp() else "Out"
+    elif release_human:
+        status = "Unreleased"                 # store says "Coming soon"/quarter/year-ahead
+    else:
+        status = result.get("status") or "Out"
+
+    result["name"]          = name
+    result["release_date"]  = release_date                       # exact ISO only, else ""
+    result["release_human"] = "" if release_date else release_human
+    result["status"]        = status
+    result.setdefault("summary", desc[:300] if desc else "")
     result["genres"]    = _map_game_genres(result.get("genres") or [])
     result["platforms"] = _map_game_platforms(result.get("platforms") or [])
     return result
@@ -1300,6 +1540,8 @@ async def save_game_to_notion(game: dict) -> str:
         props["Review"] = {"url": game["review_url"]}
     if game.get("video_url"):
         props["Video"] = {"url": game["video_url"]}
+    if game.get("store_url"):
+        props["Store"] = {"url": game["store_url"]}
     if game.get("developer"):
         props["Developer"] = {"rich_text": _rich_text(game["developer"])}
     genres = game.get("genres") or []
@@ -1345,19 +1587,24 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
     status       = game_data.get("status", "Out")
     if status not in ("Unreleased", "Out", "Playing", "Finished"):
         status = "Out"
-    release_date = _clean_field(game_data.get("release_date", ""))
-    summary      = game_data.get("summary", "")
+    release_date  = _clean_field(game_data.get("release_date", ""))    # exact ISO, else ""
+    release_human = _clean_field(game_data.get("release_human", ""))   # approx text, else ""
+    store_url     = game_data.get("store_url", "")
+    summary       = game_data.get("summary", "")
     if note:
         summary = note + (" — " + summary if summary else "")
 
-    # Video: if the shared URL is a video use it directly; otherwise search for a trailer
+    # Decide which URL is the trailer vs the review, and auto-find the missing one.
     if _is_video_url(url):
-        video_url  = url
+        video_url, review_url = url, ""
+    elif _is_game_url(url):
+        store_url  = store_url or url
+        video_url  = await find_game_trailer(name) if name else ""
         review_url = ""
     else:
         review_url = url
         video_url  = await find_game_trailer(name) if name else ""
-    print(f"[game] video_url={video_url!r}")
+    print(f"[game] store={store_url!r} video={video_url!r} review={review_url!r}")
 
     pid = str(uuid.uuid4())[:8]
     PENDING[pid] = {
@@ -1375,6 +1622,7 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
         "platforms":    platforms,
         "status":        status,
         "release_date":  release_date,
+        "store_url":     store_url,
         "review_url":    review_url,
         "video_url":     video_url,
     }
@@ -1389,10 +1637,16 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
     detail = status
     if release_date:
         detail += f"  ·  📅 {release_date}"
+    elif release_human:
+        detail += f"  ·  📅 ~{release_human}"
     if detail:
         lines.append(detail)
+    if store_url:
+        lines.append(f"🛒 [Store]({store_url})")
     if video_url:
         lines.append(f"🎬 [Trailer]({video_url})")
+    if review_url:
+        lines.append(f"📝 [Review]({review_url})")
     if summary:
         lines.append(f"\n{summary}")
     lines.append("\n*How hyped?*")
@@ -1418,6 +1672,7 @@ async def _do_save_game(chat_id: int, pending: dict, message_id: int | None = No
             "name":       pending["name"],
             "review_url": pending.get("review_url", ""),
             "video_url":  pending.get("video_url", ""),
+            "store_url":  pending.get("store_url", ""),
             "developer":  pending.get("developer", ""),
             "genres":     pending.get("genres", []),
             "platforms":  pending.get("platforms", []),
@@ -2573,39 +2828,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "igdb-slug-1"}
-
-
-@app.get("/api/igdb-test")
-async def igdb_test(url: str = "", name: str = "Forza Horizon 6"):
-    """Debug endpoint: show IGDB result + Notion DB schema."""
-    try:
-        meta = {}
-        if url:
-            meta = await fetch_page_meta(url)
-            name = meta.get("title", name)
-        igdb_result = await igdb_search_game(name)
-        analysed    = await analyse_game_link(url or f"https://store.steampowered.com/app/0/{name}/", meta or {"title": name})
-
-        # Fetch the actual Notion DB schema
-        notion_schema = {}
-        if NOTION_DB_GAME:
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(
-                    f"https://api.notion.com/v1/databases/{NOTION_DB_GAME}",
-                    headers=NOTION_HEADERS,
-                )
-            if r.status_code == 200:
-                notion_schema = {k: v["type"] for k, v in r.json().get("properties", {}).items()}
-            else:
-                notion_schema = {"error": r.status_code, "body": r.text}
-
-        return {
-            "meta_title":    name,
-            "igdb_raw":      igdb_result,
-            "analysed":      analysed,
-            "notion_schema": notion_schema,
-        }
-    except Exception as e:
-        import traceback
-        return {"error": str(e), "traceback": traceback.format_exc()}
+    return {"ok": True, "v": "game-pipeline-1"}

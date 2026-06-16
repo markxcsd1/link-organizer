@@ -14,6 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import api.index as app_module
 from api.index import (
     fetch_page_meta,
+    jina_reader_meta,
+    apify_maps_lookup,
     notion_search,
     notion_query_db_rows,
     insert_into_trip_db,
@@ -419,3 +421,73 @@ class TestNotionQueryFilters:
         body = json.loads(route.calls[0].request.content)
         assert "filter" not in body
         assert body["sorts"] == [{"property": "Name", "direction": "ascending"}]
+
+
+# ── jina_reader_meta ──────────────────────────────────────────────────────────
+
+class TestJinaReaderMeta:
+    @respx.mock
+    async def test_parses_json_data(self):
+        respx.route(method="GET", url__regex=r"^https://r\.jina\.ai/").mock(
+            return_value=httpx.Response(200, json={"data": {
+                "title": "Hades II",
+                "description": "A rogue-like dungeon crawler.",
+                "content": "Release Date: 6 May, 2024\nDeveloper: Supergiant",
+            }}))
+        meta = await jina_reader_meta("https://example.com/game")
+        assert meta["title"] == "Hades II"
+        assert "rogue-like" in meta["desc"]
+        assert "Release Date" in meta["content"]
+
+    @respx.mock
+    async def test_failure_returns_empty(self):
+        respx.route(method="GET", url__regex=r"^https://r\.jina\.ai/").mock(
+            return_value=httpx.Response(500))
+        assert await jina_reader_meta("https://example.com/x") == {}
+
+
+class TestFetchPageMetaJinaFallback:
+    @respx.mock
+    async def test_generic_title_overridden_by_jina(self):
+        """A JS-heavy host with a shell title must be re-read through Jina."""
+        url = "https://www.xbox.com/en-US/games/store/forza/9XYZ"
+        respx.get(url).mock(return_value=httpx.Response(
+            200, text="<html><head><title>Xbox Official Site | Xbox</title></head></html>"))
+        respx.route(method="GET", url__regex=r"^https://r\.jina\.ai/").mock(
+            return_value=httpx.Response(200, json={"data": {
+                "title": "Forza Horizon 6", "description": "Race across Japan.", "content": ""}}))
+        meta = await fetch_page_meta(url)
+        assert meta["title"] == "Forza Horizon 6"
+
+
+# ── apify_maps_lookup ─────────────────────────────────────────────────────────
+
+class TestApifyMapsLookup:
+    async def test_no_token_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(app_module, "APIFY_TOKEN", "")
+        assert await apify_maps_lookup("anything") == {}
+
+    @respx.mock
+    async def test_parses_dataset_item(self, monkeypatch):
+        monkeypatch.setattr(app_module, "APIFY_TOKEN", "test-apify-token")
+        respx.post(url__regex=r"https://api\.apify\.com/.*run-sync-get-dataset-items").mock(
+            return_value=httpx.Response(200, json=[{
+                "title": "Loggia Wine Bar",
+                "totalScore": 4.7,
+                "reviewsCount": 321,
+                "address": "Apollonia, Sifnos",
+                "categoryName": "Wine bar",
+                "website": "https://loggia.example",
+            }]))
+        out = await apify_maps_lookup("Loggia Wine Bar Sifnos")
+        assert out["rating"] == 4.7
+        assert out["reviews_count"] == 321
+        assert out["category"] == "Wine bar"
+        assert out["address"] == "Apollonia, Sifnos"
+
+    @respx.mock
+    async def test_empty_dataset_returns_empty(self, monkeypatch):
+        monkeypatch.setattr(app_module, "APIFY_TOKEN", "test-apify-token")
+        respx.post(url__regex=r"https://api\.apify\.com/.*").mock(
+            return_value=httpx.Response(200, json=[]))
+        assert await apify_maps_lookup("nothing here") == {}

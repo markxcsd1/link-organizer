@@ -14,11 +14,15 @@ from api.index import (
     _map_game_genres,
     _map_game_platforms,
     _is_game_url,
+    _is_generic_title,
+    _extract_store_release_date,
+    _select_igdb_release,
     parse_command,
     _rich_text,
     NOTION_DB,
     CATEGORY_EMOJI,
 )
+from datetime import datetime, timezone
 
 
 # ── _extract_json ─────────────────────────────────────────────────────────────
@@ -365,3 +369,118 @@ class TestIsGameUrl:
     ])
     def test_non_game_urls(self, url):
         assert _is_game_url(url) is False
+
+
+# ── _is_generic_title ─────────────────────────────────────────────────────────
+
+class TestIsGenericTitle:
+    @pytest.mark.parametrize("title", [
+        "",
+        "Xbox Official Site: Consoles, Games and Community | Xbox",
+        "Nintendo - Official Site",
+        "PlayStation Store",
+        "x" * 101,                         # absurdly long → treat as junk
+    ])
+    def test_generic(self, title):
+        assert _is_generic_title(title) is True
+
+    @pytest.mark.parametrize("title", [
+        "Hades II",
+        "The Legend of Zelda: Tears of the Kingdom",
+        "Elden Ring on Steam",             # store suffix but still names the game
+        "Hollow Knight: Silksong",
+    ])
+    def test_real_titles(self, title):
+        assert _is_generic_title(title) is False
+
+
+# ── _extract_store_release_date ───────────────────────────────────────────────
+
+class TestExtractStoreReleaseDate:
+    @pytest.mark.parametrize("content,iso,human_fragment", [
+        ("Release Date: 6 May, 2024", "2024-05-06", "6 May"),
+        ("Release Date: 21 Sep 2023",  "2023-09-21", "21 Sep"),
+        ("Release Date: May 12, 2023", "2023-05-12", "May 12"),
+        ("Release Date: 5/12/2023",    "2023-05-12", "5/12/2023"),
+        ("Release date: 2023-05-12",   "2023-05-12", "2023-05-12"),
+    ])
+    def test_exact_dates(self, content, iso, human_fragment):
+        d, human = _extract_store_release_date(content)
+        assert d == iso
+        assert human_fragment in human
+
+    @pytest.mark.parametrize("content,human", [
+        ("Release Date: Coming soon", "Coming soon"),
+        ("Release Date: Q1 2025",     "Q1 2025"),
+        ("Release Date: 2025",        "2025"),
+        ("Release Date: To be announced", "To be announced"),
+    ])
+    def test_approximate_dates(self, content, human):
+        d, h = _extract_store_release_date(content)
+        assert d == ""
+        assert human in h
+
+    def test_no_label(self):
+        assert _extract_store_release_date("Some random page text") == ("", "")
+
+    def test_empty(self):
+        assert _extract_store_release_date("") == ("", "")
+
+
+# ── _select_igdb_release ──────────────────────────────────────────────────────
+
+def _ts(y, m, d):
+    return int(datetime(y, m, d, tzinfo=timezone.utc).timestamp())
+
+
+class TestSelectIgdbRelease:
+    def test_exact_category0(self):
+        ts = _ts(2024, 5, 6)
+        game = {"release_dates": [
+            {"category": 0, "date": ts, "region": 8, "human": "May 06, 2024"},
+        ]}
+        iso, human, out_ts = _select_igdb_release(game)
+        assert iso == "2024-05-06"
+        assert out_ts == ts
+
+    def test_prefers_exact_over_approx(self):
+        ts = _ts(2024, 5, 6)
+        game = {"release_dates": [
+            {"category": 2, "date": ts - 5000, "region": 1, "human": "2024"},
+            {"category": 0, "date": ts,        "region": 2, "human": "May 06, 2024"},
+        ]}
+        iso, _, _ = _select_igdb_release(game)
+        assert iso == "2024-05-06"          # exact wins even though approx ts is earlier
+
+    def test_year_only_is_approximate(self):
+        ts = _ts(2025, 1, 1)
+        game = {"release_dates": [
+            {"category": 2, "date": ts, "region": 8, "human": "2025"},
+        ]}
+        iso, human, out_ts = _select_igdb_release(game)
+        assert iso == ""                    # never fabricate a precise day
+        assert human == "2025"
+        assert out_ts == ts
+
+    def test_quarter_is_approximate(self):
+        game = {"release_dates": [
+            {"category": 3, "date": _ts(2026, 1, 1), "region": 8, "human": "Q1 2026"},
+        ]}
+        iso, human, _ = _select_igdb_release(game)
+        assert iso == ""
+        assert human == "Q1 2026"
+
+    def test_fallback_first_release_date_ts_only(self):
+        game = {"first_release_date": _ts(2024, 5, 6)}
+        iso, human, ts = _select_igdb_release(game)
+        assert iso == "" and human == ""    # ts only — not a precise written date
+        assert ts == _ts(2024, 5, 6)
+
+    def test_empty_game(self):
+        assert _select_igdb_release({}) == ("", "", None)
+
+    def test_ignores_non_dict_entries(self):
+        game = {"release_dates": [123, None,
+                {"category": 0, "date": _ts(2022, 2, 1), "region": 8, "human": "x"}]}
+        iso, _, _ = _select_igdb_release(game)
+        assert iso == "2022-02-01"
