@@ -1500,26 +1500,55 @@ def _norm_name(s: str) -> str:
     return re.sub(r'[^a-z0-9]', '', (s or '').lower())
 
 
-async def _find_store_url(game_name: str) -> str:
-    """Find a store page when IGDB has no website. Steam's app-search API first
-    (reliable JSON, no key), then a DuckDuckGo fallback."""
-    # 1. Steam app search.
+# Auxiliary Steam apps to skip when matching a game (playtests, demos, soundtracks…)
+_STEAM_AUX = ("playtest", "demo", "beta", "soundtrack", "ost", "server",
+              "sdk", "artbook", "bonus", "dedicated")
+
+
+def _steam_is_aux(name: str) -> bool:
+    low = (name or "").lower()
+    return any(x in low for x in _STEAM_AUX)
+
+
+async def _steam_search_appid(game_name: str) -> str:
+    """
+    Best Steam appid for a game name. Steam's search ranks playtests/demos above the
+    real game for short titles, so prefer an exact (normalized) name match and skip
+    auxiliary apps. Returns '' on miss.
+    """
+    if not game_name:
+        return ""
+    target = _norm_name(game_name)
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
                 f"https://steamcommunity.com/actions/SearchApps/{quote(game_name)}")
-        if r.status_code == 200:
-            target = _norm_name(game_name)
-            for app in (r.json() or [])[:5]:
-                if not isinstance(app, dict):
-                    continue
-                appid, nm = app.get("appid"), _norm_name(app.get("name", ""))
-                # Accept only a confident match (exact or one contains the other).
-                if appid and nm and (nm == target or target in nm or nm in target):
-                    return f"https://store.steampowered.com/app/{appid}/"
+        if r.status_code != 200:
+            return ""
+        apps = [a for a in (r.json() or [])
+                if isinstance(a, dict) and a.get("appid") and a.get("name")]
     except Exception:
-        pass
-    # 2. DuckDuckGo fallback for a Steam store page.
+        return ""
+    # 1. exact normalized match, not an auxiliary app
+    for a in apps:
+        if _norm_name(a["name"]) == target and not _steam_is_aux(a["name"]):
+            return a["appid"]
+    # 2. exact normalized match even if auxiliary
+    for a in apps:
+        if _norm_name(a["name"]) == target:
+            return a["appid"]
+    # 3. non-auxiliary partial match (the search target appears in the name)
+    for a in apps:
+        if not _steam_is_aux(a["name"]) and target and target in _norm_name(a["name"]):
+            return a["appid"]
+    return ""
+
+
+async def _find_store_url(game_name: str) -> str:
+    """Find a Steam store page. Steam's app-search API first, DuckDuckGo as fallback."""
+    appid = await _steam_search_appid(game_name)
+    if appid:
+        return f"https://store.steampowered.com/app/{appid}/"
     try:
         async with httpx.AsyncClient(
             timeout=10, follow_redirects=True,
@@ -1685,46 +1714,55 @@ async def steam_appdetails(appid: str) -> dict:
 
 async def analyse_game_link(url: str, meta: dict) -> dict:
     """
-    Resolve a game from a trailer / review / store link:
-      Steam store URL → Steam's own app data (the appid is unambiguous).
-      Otherwise: title → IGDB (genre/dev/platform + store URL + structured dates)
-      → store page (via Jina) for the authoritative release date.
-    IGDB is never trusted for the precise day; we only write an exact date when the
-    store page or an IGDB exact (category 0) entry provides one.
+    Resolve a game from a trailer / review / store link.
+      • If the game is on Steam (store URL, or found via Steam search), use Steam's
+        appdetails for authoritative name/developer/genres/date — the appid is
+        unambiguous, which avoids bad name matches (e.g. "Delta", "over the hill").
+      • IGDB enriches console platforms (Steam only knows PC) and is the fallback for
+        games not on Steam; Groq is the last resort.
+    IGDB/Groq are never trusted for the precise day — an exact date is only written
+    when Steam, an IGDB exact (category 0) entry, or the store page provides one.
     """
     title = meta.get("title", "")
     desc  = meta.get("desc", "")
 
-    # ── Steam store URL → Steam's authoritative data (avoids bad name matches) ──
-    appid = _steam_appid(url)
-    if appid:
-        steam = await steam_appdetails(appid)
-        if steam.get("name"):
-            print(f"[steam] {appid} -> {steam['name']!r}")
-            steam["status"] = "Unreleased" if steam.pop("coming_soon", False) else "Out"
-            steam.setdefault("summary", desc[:300] if desc else "")
-            return steam
-
-    # If the page title looks like a site header, fall back to the URL slug.
     slug = _game_name_from_url(url)
-    if slug and _is_generic_title(title):
-        print(f"[game] generic title {title!r}, using slug {slug!r}")
-        title = slug
+    search_name = slug if (slug and _is_generic_title(title)) else title
+    cleaned = _clean_game_title(search_name) or search_name
 
-    # ── Resolve via IGDB (with Groq as last resort) ──────────────────────────
+    # ── Steam first: appid from the URL, else search Steam by name ───────────
+    appid = _steam_appid(url) or await _steam_search_appid(cleaned)
+    steam = await steam_appdetails(appid) if appid else {}
+
+    # ── IGDB: search by Steam's exact name when known (platforms + fallback) ──
     igdb: dict = {}
-    if TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and title:
+    igdb_query = steam.get("name") or cleaned
+    if TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET and igdb_query:
         try:
-            igdb = await igdb_search_game(title)
-            if not igdb.get("name") and slug and slug.lower() != title.lower():
-                print(f"[igdb] miss on {title!r}, retrying with slug {slug!r}")
+            igdb = await igdb_search_game(igdb_query)
+            if not igdb.get("name") and slug and _norm_name(slug) != _norm_name(igdb_query):
                 igdb = await igdb_search_game(slug)
         except Exception as e:
             print(f"[igdb] search failed: {e}")
             igdb = {}
 
-    result = dict(igdb) if igdb.get("name") else await _groq_game_fallback(url, title, desc)
-    name = _clean_field(result.get("name", "")) or title
+    # ── Steam is authoritative when it matched ───────────────────────────────
+    if steam.get("name"):
+        print(f"[steam] {appid} -> {steam['name']!r}")
+        result = dict(steam)
+        result["status"] = "Unreleased" if result.pop("coming_soon", False) else "Out"
+        # Enrich console platforms from IGDB only when it's clearly the same game.
+        if igdb.get("name") and _norm_name(igdb["name"]) == _norm_name(steam["name"]):
+            result["platforms"] = list(dict.fromkeys(
+                (result.get("platforms") or []) + (igdb.get("platforms") or [])))
+        result.setdefault("summary", desc[:300] if desc else "")
+        result["genres"]    = _map_game_genres(result.get("genres") or [])
+        result["platforms"] = _map_game_platforms(result.get("platforms") or [])
+        return result
+
+    # ── Not on Steam → IGDB, else Groq ───────────────────────────────────────
+    result = dict(igdb) if igdb.get("name") else await _groq_game_fallback(url, cleaned, desc)
+    name = _clean_field(result.get("name", "")) or cleaned
 
     # ── Locate the store page ────────────────────────────────────────────────
     store_url = result.get("store_url") or ""
@@ -3144,4 +3182,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-pipeline-7"}
+    return {"ok": True, "v": "game-pipeline-8"}

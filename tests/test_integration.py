@@ -581,3 +581,28 @@ class TestSteamAppdetails:
         respx.get(url__regex=r"store\.steampowered\.com/api/appdetails").mock(
             return_value=httpx.Response(200, json={"999": {"success": False}}))
         assert await steam_appdetails("999") == {}
+
+
+# ── _steam_search_appid (exact match over playtest/demo) ──────────────────────
+
+from api.index import _steam_search_appid
+
+class TestSteamSearchAppid:
+    @respx.mock
+    async def test_prefers_exact_over_playtest(self):
+        # Steam ranks the Playtest and an unrelated game above the real one.
+        respx.get(url__regex=r"steamcommunity\.com/actions/SearchApps/").mock(
+            return_value=httpx.Response(200, json=[
+                {"appid": "4658140", "name": "over the hill Playtest"},
+                {"appid": "396860",  "name": "Over The Hills And Far Away"},
+                {"appid": "2929250", "name": "over the hill"},
+            ]))
+        assert await _steam_search_appid("over the hill") == "2929250"
+
+    @respx.mock
+    async def test_no_exact_match_returns_empty(self):
+        respx.get(url__regex=r"steamcommunity\.com/actions/SearchApps/").mock(
+            return_value=httpx.Response(200, json=[
+                {"appid": "1", "name": "Completely Unrelated Title"},
+            ]))
+        assert await _steam_search_appid("over the hill") == ""
