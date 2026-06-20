@@ -22,6 +22,8 @@ from api.index import (
     _clean_game_title,
     _parse_exact_date,
     _clean_video_url,
+    _steam_appid,
+    _metacritic_url,
     parse_command,
     _rich_text,
     NOTION_DB,
@@ -610,3 +612,33 @@ class TestCleanVideoUrl:
 
     def test_non_youtube_unchanged(self):
         assert _clean_video_url("https://vimeo.com/123456") == "https://vimeo.com/123456"
+
+
+# ── _steam_appid ──────────────────────────────────────────────────────────────
+
+class TestSteamAppid:
+    @pytest.mark.parametrize("url,appid", [
+        ("https://store.steampowered.com/app/3714420/Delta/", "3714420"),
+        ("https://store.steampowered.com/app/1145360/Hades/", "1145360"),
+        ("https://store.steampowered.com/app/2483190/", "2483190"),
+        ("https://www.youtube.com/watch?v=abc", ""),
+        ("https://www.gog.com/game/disco_elysium", ""),
+    ])
+    def test_extract(self, url, appid):
+        assert _steam_appid(url) == appid
+
+
+# ── _metacritic_url ───────────────────────────────────────────────────────────
+
+class TestMetacriticUrl:
+    @pytest.mark.parametrize("name,expected", [
+        ("Forza Horizon 6",        "https://www.metacritic.com/game/forza-horizon-6/"),
+        ("Baldur's Gate 3",        "https://www.metacritic.com/game/baldurs-gate-3/"),
+        ("The Last of Us Part II", "https://www.metacritic.com/game/the-last-of-us-part-ii/"),
+        ("Hades II",               "https://www.metacritic.com/game/hades-ii/"),
+    ])
+    def test_slug(self, name, expected):
+        assert _metacritic_url(name) == expected
+
+    def test_empty(self):
+        assert _metacritic_url("") == ""

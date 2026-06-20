@@ -521,17 +521,63 @@ class TestFindStoreUrl:
 
 class TestFindGameReview:
     @respx.mock
-    async def test_returns_reputable_domain(self):
+    async def test_prefers_metacritic_when_it_resolves(self):
+        respx.get(url__regex=r"metacritic\.com/game/").mock(
+            return_value=httpx.Response(200, text="<html>Forza reviews</html>"))
+        out = await find_game_review("Forza Horizon 6")
+        assert out == "https://www.metacritic.com/game/forza-horizon-6/"
+
+    @respx.mock
+    async def test_falls_back_to_ddg_when_metacritic_404s(self):
+        respx.get(url__regex=r"metacritic\.com/game/").mock(
+            return_value=httpx.Response(404, text="not found"))
         html = ('<a href="/l/?uddg=https%3A%2F%2Fwww.gamespot.com%2Freviews%2F'
-                'forza-horizon-6-review%2F1900-6418489%2F">GameSpot</a>')
+                'some-game-review%2F1900-1%2F">GameSpot</a>')
         respx.get(url__regex=r"html\.duckduckgo\.com/html").mock(
             return_value=httpx.Response(200, text=html))
-        out = await find_game_review("Forza Horizon 6")
+        out = await find_game_review("Some Obscure Slug Game")
         assert "gamespot.com" in out
 
     @respx.mock
-    async def test_skips_unreputable(self):
-        html = '<a href="/l/?uddg=https%3A%2F%2Frandomblog.example%2Fpost">blog</a>'
+    async def test_empty_when_metacritic_404_and_ddg_blank(self):
+        respx.get(url__regex=r"metacritic\.com/game/").mock(
+            return_value=httpx.Response(404, text="not found"))
         respx.get(url__regex=r"html\.duckduckgo\.com/html").mock(
-            return_value=httpx.Response(200, text=html))
+            return_value=httpx.Response(200, text="<html>no results</html>"))
         assert await find_game_review("Whatever") == ""
+
+
+# ── steam_appdetails ──────────────────────────────────────────────────────────
+
+from api.index import steam_appdetails
+
+class TestSteamAppdetails:
+    @respx.mock
+    async def test_parses_app_data(self):
+        payload = {"3714420": {"success": True, "data": {
+            "type": "game", "name": "Delta",
+            "developers": ["0xc3pti0n", "Ri"],
+            "genres": [{"description": "Action"}, {"description": "Indie"},
+                       {"description": "Racing"}],
+            "release_date": {"coming_soon": True, "date": "2026"},
+            "short_description": "A first-person movement-heavy platformer focused on speedrunning.",
+            "platforms": {"windows": True, "mac": False, "linux": True},
+        }}}
+        respx.get(url__regex=r"store\.steampowered\.com/api/appdetails").mock(
+            return_value=httpx.Response(200, json=payload))
+        out = await steam_appdetails("3714420")
+        assert out["name"] == "Delta"
+        assert out["developer"] == "0xc3pti0n"
+        assert out["platforms"] == ["PC"]
+        assert "Platformer" in out["genres"]      # supplemented from the description
+        assert "Racing" in out["genres"]          # from Steam's genre tags
+        assert out["coming_soon"] is True
+        assert out["release_date"] == ""          # "2026" is a year, not a full day
+        assert out["release_human"] == "2026"
+        assert out["store_url"] == "https://store.steampowered.com/app/3714420/"
+
+    @respx.mock
+    async def test_unsuccessful_returns_empty(self):
+        respx.get(url__regex=r"store\.steampowered\.com/api/appdetails").mock(
+            return_value=httpx.Response(200, json={"999": {"success": False}}))
+        assert await steam_appdetails("999") == {}
