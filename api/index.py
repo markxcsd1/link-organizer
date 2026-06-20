@@ -1545,22 +1545,46 @@ _REVIEW_DOMAINS = (
 )
 
 
+def _metacritic_url(game_name: str) -> str:
+    """Build the Metacritic game-page URL (slug = lowercase, apostrophes dropped,
+    other non-alphanumerics hyphenated). e.g. "Baldur's Gate 3" -> baldurs-gate-3."""
+    s = (game_name or "").lower()
+    s = re.sub(r"['’™®©:]", "", s)               # drop apostrophes/symbols, don't hyphenate them
+    slug = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return f"https://www.metacritic.com/game/{slug}/" if slug else ""
+
+
 async def find_game_review(game_name: str) -> str:
-    """DuckDuckGo for a reputable review URL. Returns '' on miss."""
+    """
+    Prefer the Metacritic game page (keyless, aggregates all critic scores, and its
+    slug is deterministic). Verify it resolves, falling back to a DuckDuckGo lookup
+    for a reputable outlet. Returns '' only if nothing pans out.
+    """
+    _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/120 Safari/537.36")
+    mc = _metacritic_url(game_name)
+    if mc:
+        try:
+            async with httpx.AsyncClient(timeout=8, follow_redirects=True,
+                                         headers={"User-Agent": _UA}) as client:
+                r = await client.get(mc)
+            if r.status_code != 404:        # 200 = ok; 403 = bot-blocked but page exists
+                return mc
+        except Exception:
+            return mc                        # network hiccup — the page still likely exists
+    # Metacritic slug looked wrong (404) → DuckDuckGo for a reputable outlet review.
     try:
         async with httpx.AsyncClient(
             timeout=10, follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                     "Accept-Language": "en-US,en;q=0.9"},
+            headers={"User-Agent": _UA, "Accept-Language": "en-US,en;q=0.9"},
         ) as client:
             r = await client.get("https://html.duckduckgo.com/html/",
                                  params={"q": f"{game_name} review"})
-        if r.status_code != 200:
-            return ""
-        for m in re.finditer(r'uddg=(https?[^&"\']+)', r.text):
-            decoded = unquote(m.group(1))
-            if any(d in decoded for d in _REVIEW_DOMAINS):
-                return decoded.split("?")[0]
+        if r.status_code == 200:
+            for m in re.finditer(r'uddg=(https?[^&"\']+)', r.text):
+                decoded = unquote(m.group(1))
+                if any(d in decoded for d in _REVIEW_DOMAINS):
+                    return decoded.split("?")[0]
     except Exception:
         pass
     return ""
@@ -1598,16 +1622,88 @@ async def _groq_game_fallback(url: str, title: str, desc: str) -> dict:
     return result
 
 
+# Distinctive subgenre terms Steam's coarse genre tags often miss — safe to read
+# from a description because they're unambiguous as whole phrases.
+_DESC_GENRE_HINTS = {
+    "platformer": "Platformer", "metroidvania": "Metroidvania",
+    "roguelike": "Roguelike", "rogue-like": "Roguelike",
+    "roguelite": "Roguelite", "rogue-lite": "Roguelite",
+    "soulslike": "Soulslike", "souls-like": "Soulslike",
+    "deckbuilder": "Deckbuilder", "deck-builder": "Deckbuilder", "deck builder": "Deckbuilder",
+    "visual novel": "Visual Novel", "tower defense": "Tower Defense",
+    "battle royale": "Battle Royale", "open world": "Open World", "open-world": "Open World",
+}
+
+
+def _steam_appid(url: str) -> str:
+    m = re.search(r'store\.steampowered\.com/app/(\d+)', url or "")
+    return m.group(1) if m else ""
+
+
+async def steam_appdetails(appid: str) -> dict:
+    """Authoritative game data from Steam's store API for a known appid (no key)."""
+    if not appid:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            r = await client.get("https://store.steampowered.com/api/appdetails",
+                                 params={"appids": appid, "l": "english"})
+        if r.status_code != 200:
+            return {}
+        entry = (r.json() or {}).get(str(appid), {})
+        if not entry.get("success"):
+            return {}
+        data = entry.get("data", {})
+        if data.get("type") != "game":
+            return {}
+        devs   = data.get("developers") or []
+        genres = _map_game_genres(
+            [g.get("description", "") for g in data.get("genres", []) if isinstance(g, dict)])
+        # Supplement coarse Steam tags with distinctive subgenres from the blurb.
+        blob = f"{data.get('name','')} {data.get('short_description','')}".lower()
+        for kw, g in _DESC_GENRE_HINTS.items():
+            if g not in genres and kw in blob:
+                genres.append(g)
+        rd       = data.get("release_date") or {}
+        date_str = (rd.get("date") or "").strip()
+        exact    = _parse_exact_date(date_str)
+        return {
+            "name":          data.get("name", ""),
+            "developer":     devs[0] if devs else "",
+            "genres":        genres,
+            "platforms":     ["PC"],
+            "release_date":  exact,
+            "release_human": "" if exact else date_str,
+            "coming_soon":   bool(rd.get("coming_soon")),
+            "summary":       (data.get("short_description") or "")[:500],
+            "store_url":     f"https://store.steampowered.com/app/{appid}/",
+        }
+    except Exception as e:
+        print(f"[steam] appdetails failed: {e}")
+        return {}
+
+
 async def analyse_game_link(url: str, meta: dict) -> dict:
     """
     Resolve a game from a trailer / review / store link:
-      title → IGDB (genre/dev/platform + store URL + structured dates)
+      Steam store URL → Steam's own app data (the appid is unambiguous).
+      Otherwise: title → IGDB (genre/dev/platform + store URL + structured dates)
       → store page (via Jina) for the authoritative release date.
     IGDB is never trusted for the precise day; we only write an exact date when the
     store page or an IGDB exact (category 0) entry provides one.
     """
     title = meta.get("title", "")
     desc  = meta.get("desc", "")
+
+    # ── Steam store URL → Steam's authoritative data (avoids bad name matches) ──
+    appid = _steam_appid(url)
+    if appid:
+        steam = await steam_appdetails(appid)
+        if steam.get("name"):
+            print(f"[steam] {appid} -> {steam['name']!r}")
+            steam["status"] = "Unreleased" if steam.pop("coming_soon", False) else "Out"
+            steam.setdefault("summary", desc[:300] if desc else "")
+            return steam
 
     # If the page title looks like a site header, fall back to the URL slug.
     slug = _game_name_from_url(url)
@@ -3048,4 +3144,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-pipeline-6"}
+    return {"ok": True, "v": "game-pipeline-7"}
