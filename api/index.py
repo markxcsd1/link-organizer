@@ -1929,10 +1929,15 @@ async def handle_save_game_link(chat_id: int, url: str, note: str, meta: dict):
         video_url  = await find_game_trailer(name) if name else ""
     video_url = _clean_video_url(video_url) if video_url else ""
     # Auto-find the pieces we don't already have.
-    if not review_url and name:
-        review_url = await find_game_review(name)
     if not store_url and name:
         store_url = await _find_store_url(name)
+    if not review_url and name:
+        review_url = await find_game_review(name)
+    # Fallback: no critic review (e.g. unreleased game) → link Steam's own reviews page.
+    if not review_url:
+        steam_appid_ = _steam_appid(store_url)
+        if steam_appid_:
+            review_url = f"https://steamcommunity.com/app/{steam_appid_}/reviews/"
     print(f"[game] store={store_url!r} video={video_url!r} review={review_url!r}")
 
     pid = str(uuid.uuid4())[:8]
@@ -3182,4 +3187,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-pipeline-8"}
+    return {"ok": True, "v": "game-pipeline-9"}
