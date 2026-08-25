@@ -32,6 +32,11 @@ TWITCH_CLIENT_SECRET  = os.environ.get("TWITCH_CLIENT_SECRET", "")
 JINA_API_KEY          = os.environ.get("JINA_API_KEY", "")      # optional: higher Jina Reader rate limit
 APIFY_TOKEN           = os.environ.get("APIFY_TOKEN", "")       # optional: enables Apify Google Maps ratings
 
+# Groq models — overridable via env so a Groq deprecation is a config change, not a deploy.
+# (Llama 3.1 8B / 3.3 70B were deprecated 2026-06-17; migrated to OpenAI GPT-OSS on Groq.)
+GROQ_MODEL_FAST       = os.environ.get("GROQ_MODEL_FAST", "openai/gpt-oss-20b")
+GROQ_MODEL_CHAT       = os.environ.get("GROQ_MODEL_CHAT", "openai/gpt-oss-120b")
+
 if NOTION_DB_GAME:
     NOTION_DB["game"] = NOTION_DB_GAME
 
@@ -214,12 +219,17 @@ async def tg_answer_callback(callback_id: str):
             json={"callback_query_id": callback_id},
         )
 
-async def groq_chat(messages: list, max_tokens: int = 512, model: str = "llama-3.1-8b-instant") -> str:
+async def groq_chat(messages: list, max_tokens: int = 512, model: str = GROQ_MODEL_FAST) -> str:
+    payload = {"model": model, "max_tokens": max_tokens, "messages": messages}
+    # GPT-OSS are reasoning models — keep effort low so reasoning tokens don't eat the
+    # answer budget (matters most for the tiny intent/modify calls).
+    if "gpt-oss" in model:
+        payload["reasoning_effort"] = "low"
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
-            json={"model": model, "max_tokens": max_tokens, "messages": messages},
+            json=payload,
         )
     r.raise_for_status()
     return r.json()["choices"][0]["message"]["content"].strip()
@@ -3056,7 +3066,7 @@ async def handle_chat(chat_id: int, text: str):
     messages.append({"role": "user", "content": text})
 
     try:
-        response = await groq_chat(messages, max_tokens=1024, model="llama-3.3-70b-versatile")
+        response = await groq_chat(messages, max_tokens=1024, model=GROQ_MODEL_CHAT)
         await tg_send(chat_id, response)
         # Store assistant reply in history
         history.append({"role": "assistant", "content": response})
@@ -3187,4 +3197,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "game-pipeline-9"}
+    return {"ok": True, "v": "groq-migrate-1"}
