@@ -3202,6 +3202,9 @@ async def health():
 
 @app.api_route("/{full_path:path}", methods=["GET", "POST"])
 async def _debug_catch_all(full_path: str, request: Request):
-    """TEMP diagnostic: reveal what path the ASGI app actually receives."""
-    return {"debug": True, "received_path": full_path, "url_path": request.url.path,
-            "routes": [r.path for r in app.routes if hasattr(r, "path")]}
+    """TEMP diagnostic: reveal received path + headers so we can restore the real path."""
+    return {"debug": True, "url_path": request.url.path,
+            "query": dict(request.query_params),
+            "headers": {k: v for k, v in request.headers.items()
+                        if "path" in k.lower() or "url" in k.lower()
+                        or "forward" in k.lower() or "vercel" in k.lower() or "original" in k.lower()}}
