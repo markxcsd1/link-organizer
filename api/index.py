@@ -7,6 +7,22 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
+
+@app.middleware("http")
+async def _restore_original_path(request: Request, call_next):
+    """
+    Vercel rewrites every /api/* request to the single /api/index function and
+    (per vercel.json) carries the original sub-path as ?__p=... — the function
+    otherwise only ever sees '/api/index'. Restore the real path so FastAPI's
+    router can match /api/health, /api/telegram, etc.
+    """
+    p = request.query_params.get("__p")
+    if p is not None:
+        real = "/api/" + p
+        request.scope["path"] = real
+        request.scope["raw_path"] = real.encode("utf-8")
+    return await call_next(request)
+
 GROQ_KEY         = os.environ["GROQ_API_KEY"]
 NOTION_KEY       = os.environ["NOTION_API_KEY"]
 SECRET_KEY       = os.environ["SECRET_KEY"]
@@ -3197,14 +3213,4 @@ async def get_logs(authorization: str = Header(...)):
 
 @app.get("/api/health")
 async def health():
-    return {"ok": True, "v": "groq-migrate-1"}
-
-
-@app.api_route("/{full_path:path}", methods=["GET", "POST"])
-async def _debug_catch_all(full_path: str, request: Request):
-    """TEMP diagnostic: reveal received path + headers so we can restore the real path."""
-    return {"debug": True, "url_path": request.url.path,
-            "query": dict(request.query_params),
-            "headers": {k: v for k, v in request.headers.items()
-                        if "path" in k.lower() or "url" in k.lower()
-                        or "forward" in k.lower() or "vercel" in k.lower() or "original" in k.lower()}}
+    return {"ok": True, "v": "vercel-path-fix"}
