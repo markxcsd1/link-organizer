@@ -3198,3 +3198,10 @@ async def get_logs(authorization: str = Header(...)):
 @app.get("/api/health")
 async def health():
     return {"ok": True, "v": "groq-migrate-1"}
+
+
+@app.api_route("/{full_path:path}", methods=["GET", "POST"])
+async def _debug_catch_all(full_path: str, request: Request):
+    """TEMP diagnostic: reveal what path the ASGI app actually receives."""
+    return {"debug": True, "received_path": full_path, "url_path": request.url.path,
+            "routes": [r.path for r in app.routes if hasattr(r, "path")]}
