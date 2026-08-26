@@ -1,24 +1,18 @@
-"""Shared fixtures and env-var stubs for the test suite."""
+"""Stub the required environment variables before `game_bot` is imported."""
 import os
-import pytest
+import sys
 
-# Stub every required env var BEFORE importing api.index
-_ENV_STUBS = {
-    "GROQ_API_KEY":        "test-groq-key",
-    "NOTION_API_KEY":      "test-notion-key",
-    "SECRET_KEY":          "test-secret",
-    "TELEGRAM_BOT_TOKEN":  "test-tg-token",
-    "TELEGRAM_USER_ID":    "123456",
-    "NOTION_DB_LOCATION":  "loc-db-id",
-    "NOTION_DB_PRODUCT":   "prod-db-id",
-    "NOTION_DB_ARTICLE":   "art-db-id",
-    "NOTION_DB_VIDEO":     "vid-db-id",
-    "NOTION_DB_RECIPE":    "rec-db-id",
-    "NOTION_DB_OTHER":     "oth-db-id",
-    "NOTION_DB_GAME":      "game-db-id",
-    "TWITCH_CLIENT_ID":    "test-twitch-id",
-    "TWITCH_CLIENT_SECRET":"test-twitch-secret",
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+_ENV = {
+    "GROQ_API_KEY":         "test-groq-key",
+    "NOTION_API_KEY":       "test-notion-key",
+    "SECRET_KEY":           "test-secret",
+    "TELEGRAM_BOT_TOKEN":   "test-tg-token",
+    "TELEGRAM_USER_ID":     "123456",
+    "NOTION_DB_GAME":       "game-db-id",
+    "TWITCH_CLIENT_ID":     "test-twitch-id",
+    "TWITCH_CLIENT_SECRET": "test-twitch-secret",
 }
-
-for k, v in _ENV_STUBS.items():
-    os.environ.setdefault(k, v)
+for _k, _v in _ENV.items():
+    os.environ.setdefault(_k, _v)

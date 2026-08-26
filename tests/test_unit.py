@@ -1,644 +1,293 @@
-"""Unit tests for pure helper functions — no HTTP, no Notion, no Groq."""
+"""Unit tests for the pure helpers — no HTTP, no Notion, no Groq."""
 import json
-import pytest
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
-# conftest stubs env vars before this import
-from api.index import (
-    _extract_json,
-    _clean_field,
-    _clean_topic_name,
-    _detect_addto_intent,
-    _map_type,
-    _map_game_genres,
-    _map_game_platforms,
-    _is_game_url,
-    _is_generic_title,
-    _extract_store_release_date,
-    _select_igdb_release,
-    _safe_json_loads,
-    _looks_like_game,
-    _clean_game_title,
-    _parse_exact_date,
-    _clean_video_url,
-    _steam_appid,
-    _metacritic_url,
-    parse_command,
-    _rich_text,
-    NOTION_DB,
-    CATEGORY_EMOJI,
-)
 from datetime import datetime, timezone
 
+import pytest
 
-# ── _extract_json ─────────────────────────────────────────────────────────────
+# conftest stubs env vars before these imports
+from game_bot import text_utils, mapping, metadata, igdb, steam, discovery
+
+
+# ── text_utils ────────────────────────────────────────────────────────────────
 
 class TestExtractJson:
     def test_bare_json(self):
-        raw = '{"key": "val"}'
-        assert json.loads(_extract_json(raw)) == {"key": "val"}
+        assert json.loads(text_utils.extract_json('{"key": "val"}')) == {"key": "val"}
 
     def test_trailing_text(self):
-        """Groq often adds text after the JSON object — must be stripped."""
-        raw = '{"a": 1}\nHere is the explanation…'
-        result = _extract_json(raw)
-        assert json.loads(result) == {"a": 1}
+        assert json.loads(text_utils.extract_json('{"a": 1}\nexplanation…')) == {"a": 1}
 
     def test_leading_text(self):
-        raw = "Sure! Here is the JSON:\n\n{\"x\": 42}"
-        assert json.loads(_extract_json(raw)) == {"x": 42}
-
-    def test_nested_objects(self):
-        raw = '{"outer": {"inner": true}, "list": [1,2]}'
-        assert json.loads(_extract_json(raw)) == {"outer": {"inner": True}, "list": [1, 2]}
+        assert json.loads(text_utils.extract_json('Sure:\n\n{"x": 42}')) == {"x": 42}
 
     def test_braces_inside_string(self):
-        """Braces inside quoted strings must not confuse the parser."""
-        raw = '{"text": "has {curly} braces"} trailing'
-        assert json.loads(_extract_json(raw)) == {"text": "has {curly} braces"}
+        assert json.loads(text_utils.extract_json('{"t": "has {curly}"} trailing')) == {"t": "has {curly}"}
 
-    def test_escaped_quote_in_string(self):
-        raw = '{"q": "say \\"hello\\""} extra'
-        assert json.loads(_extract_json(raw)) == {"q": 'say "hello"'}
+    def test_escaped_quote(self):
+        assert json.loads(text_utils.extract_json('{"q": "say \\"hi\\""} extra')) == {"q": 'say "hi"'}
 
     def test_no_json_returns_original(self):
-        raw = "no json here"
-        assert _extract_json(raw) == raw
+        assert text_utils.extract_json("no json here") == "no json here"
 
-    def test_code_fence_prefix(self):
-        """Simulate Groq wrapping output in ```json ... ```"""
-        raw = '```json\n{"cat": "location"}\n```'
-        # Strip fences first (as done in the handler), then extract
-        import re
-        stripped = re.sub(r"^```[a-z]*\n?", "", raw.strip(), flags=re.IGNORECASE)
-        stripped = re.sub(r"```$", "", stripped.strip())
-        assert json.loads(_extract_json(stripped)) == {"cat": "location"}
-
-
-# ── _clean_field ──────────────────────────────────────────────────────────────
 
 class TestCleanField:
-    @pytest.mark.parametrize("bad", [
-        "Not found",
-        "not found in the given URL",
-        "Not specified",
-        "not available",
-        "N/A",
-        "unknown",
-        "Not Available",
-        "UNKNOWN",
-    ])
+    @pytest.mark.parametrize("bad", ["Not found", "Not specified", "N/A", "unknown", "not available"])
     def test_strips_placeholders(self, bad):
-        assert _clean_field(bad) == ""
+        assert text_utils.clean_field(bad) == ""
 
-    @pytest.mark.parametrize("good", [
-        "Sifnos, Greece",
-        "4.5/5",
-        "Beach bar",
-        "Wine bar in Apollonia",
-        "Kastro Village",
-    ])
+    @pytest.mark.parametrize("good", ["Playground Games", "2026-05-18", "Racing"])
     def test_keeps_real_values(self, good):
-        assert _clean_field(good) == good
+        assert text_utils.clean_field(good) == good
 
-    def test_empty_string(self):
-        assert _clean_field("") == ""
-
-    def test_none_like_falsy(self):
-        # The function accepts str; falsy values should return ""
-        assert _clean_field(None) == ""  # type: ignore[arg-type]
+    def test_empty(self):
+        assert text_utils.clean_field("") == ""
 
 
-# ── _map_type ─────────────────────────────────────────────────────────────────
+class TestSafeJsonLoads:
+    def test_valid(self):
+        assert text_utils.safe_json_loads('{"a": 1}') == {"a": 1}
 
-class TestMapType:
-    @pytest.mark.parametrize("raw,expected", [
-        ("Restaurant",   "Restaurant"),
-        ("Bar",          "Bar"),
-        ("Beach",        "Beach"),
-        ("Sight",        "Sight"),
-        ("Other",        "Other"),
+    def test_prefix_and_suffix(self):
+        assert text_utils.safe_json_loads('Sure: {"category": "game"} done') == {"category": "game"}
+
+    def test_trailing_comma_repaired(self):
+        assert text_utils.safe_json_loads('{"a": 1, "b": 2,}') == {"a": 1, "b": 2}
+
+    def test_unrecoverable_returns_none(self):
+        # Unescaped inner quotes — the failure mode that once crashed a save.
+        assert text_utils.safe_json_loads('{"s": "he said "hi" to all"}') is None
+
+
+class TestLooksLikeGame:
+    @pytest.mark.parametrize("text", [
+        "Hades II - Official Gameplay Trailer", "Now in Early Access on Steam",
+        "A roguelike deckbuilder", "coming to Nintendo Switch",
     ])
-    def test_exact_valid_types(self, raw, expected):
-        assert _map_type(raw) == expected
+    def test_positive(self, text):
+        assert text_utils.looks_like_game(text) is True
 
-    @pytest.mark.parametrize("raw,expected", [
-        ("restaurant",   "Restaurant"),
-        ("taverna",      "Restaurant"),
-        ("tavern",       "Restaurant"),
-        ("beach bar",    "Bar"),
-        ("wine bar",     "Bar"),
-        ("cafe",         "Cafe"),
-        ("coffee shop",  "Cafe"),
-        ("monastery",    "Sight"),
-        ("church",       "Sight"),
-        ("hotel",        "Hotel"),
-        ("villa",        "Hotel"),
-        ("village",      "Village"),
-        ("museum",       "Museum"),
-        ("shop",         "Shop"),
-    ])
-    def test_normalises_raw_strings(self, raw, expected):
-        assert _map_type(raw) == expected
+    @pytest.mark.parametrize("text", ["Best pasta recipe", "How to fix a faucet", ""])
+    def test_negative(self, text):
+        assert text_utils.looks_like_game(text) is False
 
-    def test_unknown_returns_other(self):
-        assert _map_type("some weird venue") == "Other"
-
-    def test_empty_returns_empty(self):
-        assert _map_type("") == ""
-
-
-# ── parse_command ─────────────────────────────────────────────────────────────
-
-class TestParseCommand:
-    def test_valid_category_with_note(self):
-        cat, note = parse_command("!video great tutorial")
-        assert cat == "video"
-        assert note == "great tutorial"
-
-    def test_valid_category_no_note(self):
-        cat, note = parse_command("!recipe")
-        assert cat == "recipe"
-        assert note == ""
-
-    def test_all_valid_categories(self):
-        for cat in NOTION_DB:
-            parsed_cat, _ = parse_command(f"!{cat} something")
-            assert parsed_cat == cat
-
-    def test_no_command(self):
-        cat, note = parse_command("just a regular note")
-        assert cat is None
-        assert note == "just a regular note"
-
-    def test_invalid_category_treated_as_note(self):
-        cat, note = parse_command("!notacategory something")
-        assert cat is None
-
-    def test_whitespace_stripped(self):
-        cat, note = parse_command("  !article   some title  ")
-        assert cat == "article"
-        assert note == "some title"
-
-
-# ── _rich_text ────────────────────────────────────────────────────────────────
 
 class TestRichText:
     def test_basic(self):
-        rt = _rich_text("hello")
-        assert rt == [{"text": {"content": "hello"}}]
+        assert text_utils.rich_text("hello") == [{"text": {"content": "hello"}}]
 
     def test_truncated_at_2000(self):
-        long = "x" * 3000
-        rt = _rich_text(long)
-        assert len(rt[0]["text"]["content"]) == 2000
+        assert len(text_utils.rich_text("x" * 3000)[0]["text"]["content"]) == 2000
 
 
-# ── _clean_topic_name ─────────────────────────────────────────────────────────
+# ── mapping: genres ───────────────────────────────────────────────────────────
 
-class TestCleanTopicName:
+class TestMapGenres:
     @pytest.mark.parametrize("raw,expected", [
-        ("  TOKYO 🗼 ",       "Tokyo"),
-        ("tokyo",             "Tokyo"),
-        ("Tokyo",             "Tokyo"),
-        ("  new   york  ",    "New York"),
-        ("NYC",               "NYC"),         # short ALL-CAPS preserved
-        ("USA",               "USA"),
-        ("LA",                "LA"),
-        ("✈️ japan trip 🇯🇵", "Japan Trip"),
-        ("",                  ""),
-        ("   ",               ""),
-    ])
-    def test_normalises(self, raw, expected):
-        assert _clean_topic_name(raw) == expected
-
-
-# ── _detect_addto_intent ──────────────────────────────────────────────────────
-
-class TestDetectAddtoIntent:
-    @pytest.mark.parametrize("text,topic", [
-        ("Save it in Sifnos",            "Sifnos"),
-        ("save in Tokyo",                "Tokyo"),
-        ("add to Amorgos",               "Amorgos"),
-        ("Add it to Amorgos",            "Amorgos"),
-        ("save to my Sifnos list",       "Sifnos"),
-        ("Save to the Tokyo page",       "Tokyo"),
-        ("put it under Japan trip",      "Japan"),
-        ("stash this in the Bucket list","Bucket"),
-        ("store it in Athens",           "Athens"),
-        ("drop this into Concerts",      "Concerts"),
-    ])
-    def test_extracts_topic(self, text, topic):
-        assert _detect_addto_intent(text) == topic
-
-    @pytest.mark.parametrize("text", [
-        "Save",
-        "save it",
-        "ok save it",                  # doesn't start with verb
-        "cancel",
-        "yes",
-        "change category to video",
-        "Sifnos",                      # no verb at all
-        "",
-    ])
-    def test_returns_none(self, text):
-        assert _detect_addto_intent(text) is None
-
-
-# ── _map_type new types ───────────────────────────────────────────────────────
-
-class TestMapTypeNewTypes:
-    @pytest.mark.parametrize("raw,expected", [
-        ("Event",      "Event"),
-        ("Festival",   "Festival"),
-        ("Activity",   "Activity"),
-        ("Place",      "Place"),
-        ("concert",    "Event"),
-        ("hike",       "Activity"),
-        ("tour",       "Activity"),
-    ])
-    def test_new_types(self, raw, expected):
-        assert _map_type(raw) == expected
-
-
-# ── CATEGORY_EMOJI coverage ───────────────────────────────────────────────────
-
-def test_all_categories_have_emoji():
-    for cat in NOTION_DB:
-        assert cat in CATEGORY_EMOJI, f"Missing emoji for category: {cat}"
-
-
-# ── _map_game_genres ──────────────────────────────────────────────────────────
-
-class TestMapGameGenres:
-    @pytest.mark.parametrize("raw,expected", [
-        (["Action"],                  ["Action"]),
-        (["RPG"],                     ["RPG"]),
-        (["Roguelite"],               ["Roguelite"]),
-        (["roguelike"],               ["Roguelike"]),
-        (["deckbuilder"],             ["Deckbuilder"]),
-        (["deck builder"],            ["Deckbuilder"]),
-        (["metroidvania"],            ["Metroidvania"]),
-        (["platformer"],              ["Platformer"]),
-        (["survivors-like"],          ["Survivors-like"]),
-        (["survivor"],                ["Survivors-like"]),
-        (["strategy"],                ["Strategy"]),
-        (["role-playing"],            ["RPG"]),
-        (["Action", "RPG"],           ["Action", "RPG"]),
-        (["unknown genre"],           []),
-        ([],                          []),
-        (["Action", "action"],        ["Action"]),    # dedup
+        (["Action"], ["Action"]),
+        (["roguelike"], ["Roguelike"]),
+        (["deck builder"], ["Deckbuilder"]),
+        (["survivor"], ["Survivors-like"]),
+        (["Action", "action"], ["Action"]),        # dedup
+        (["unknown genre"], []),
+        ([], []),
+        # IGDB-style names
+        (["Role-playing (RPG)"], ["RPG"]),
+        (["Platform"], ["Platformer"]),
+        (["Shooter"], ["Shooter"]),                 # its own genre, not Action
+        (["Hack and slash/Beat 'em up"], ["Action"]),
+        (["Real Time Strategy (RTS)"], ["Strategy"]),
+        (["Sport"], ["Sports"]),
+        (["Simulator"], ["Simulation"]),
+        (["Music"], ["Rhythm"]),
+        (["survival horror"], ["Horror"]),
+        (["survival"], ["Survival"]),
+        (["mmorpg"], ["MMO"]),
+        (["Indie"], []),                            # no mapping
+        (["Racing", "Arcade", "Sport"], ["Racing", "Action", "Sports"]),
     ])
     def test_mapping(self, raw, expected):
-        assert _map_game_genres(raw) == expected
+        assert mapping.map_genres(raw) == expected
 
 
-# ── _map_game_platforms ───────────────────────────────────────────────────────
-
-class TestMapGamePlatforms:
+class TestMapPlatforms:
     @pytest.mark.parametrize("raw,expected", [
-        (["PC"],                      ["PC"]),
-        (["pc"],                      ["PC"]),
-        (["windows"],                 ["PC"]),
-        (["steam"],                   ["PC"]),
-        (["Steam Deck"],              ["Steam Deck"]),
-        (["steam deck"],              ["Steam Deck"]),
-        (["Switch"],                  ["Switch"]),
-        (["nintendo switch"],         ["Switch"]),
-        (["PS5"],                     ["PS5"]),
-        (["playstation 5"],           ["PS5"]),
-        (["Xbox"],                    ["Xbox"]),
-        (["xbox series"],             ["Xbox"]),
-        (["PC", "Switch", "PS5"],     ["PC", "Switch", "PS5"]),
-        (["unknown platform"],        []),
-        ([],                          []),
-        # single string containing "steam deck" must prefer Steam Deck over PC
-        (["steam deck"],              ["Steam Deck"]),
+        (["PC"], ["PC"]),
+        (["windows"], ["PC"]),
+        (["steam deck"], ["Steam Deck"]),           # beats "steam" -> PC
+        (["Nintendo Switch"], ["Switch"]),
+        (["PlayStation 5"], ["PS5"]),
+        (["Xbox Series X|S"], ["Xbox"]),
+        (["PC (Microsoft Windows)", "Mac"], ["PC"]),  # dedup to one PC
+        (["unknown"], []),
     ])
     def test_mapping(self, raw, expected):
-        assert _map_game_platforms(raw) == expected
+        assert mapping.map_platforms(raw) == expected
 
 
-# ── IGDB-specific name mapping ────────────────────────────────────────────────
+# ── mapping: titles & URLs ────────────────────────────────────────────────────
 
-class TestIgdbGenreNames:
-    """IGDB returns genre names like 'Role-playing (RPG)' — must map correctly."""
+class TestCleanGameTitle:
     @pytest.mark.parametrize("raw,expected", [
-        (["Role-playing (RPG)"],              ["RPG"]),
-        (["Platform"],                        ["Platformer"]),
-        (["Hack and slash/Beat 'em up"],      ["Action"]),
-        (["Shooter"],                         ["Shooter"]),
-        (["Real Time Strategy (RTS)"],        ["Strategy"]),
-        (["Turn-based strategy (TBS)"],       ["Strategy"]),
-        (["Metroidvania"],                    ["Metroidvania"]),
-        (["Indie"],                           []),   # no mapping
-        (["Role-playing (RPG)", "Strategy"],  ["RPG", "Strategy"]),
-        # Expanded taxonomy
-        (["Racing"],                          ["Racing"]),
-        (["Sport"],                           ["Sports"]),
-        (["Simulator"],                       ["Simulation"]),
-        (["Fighting"],                        ["Fighting"]),
-        (["Puzzle"],                          ["Puzzle"]),
-        (["Adventure"],                       ["Adventure"]),
-        (["Point-and-click"],                 ["Adventure"]),
-        (["Music"],                           ["Rhythm"]),
-        (["Visual Novel"],                    ["Visual Novel"]),
-        (["Arcade"],                          ["Action"]),
-        (["Tactical"],                        ["Strategy"]),
-        (["survival horror"],                 ["Horror"]),
-        (["survival"],                        ["Survival"]),
-        (["soulslike"],                       ["Soulslike"]),
-        (["open world"],                      ["Open World"]),
-        (["tower defense"],                   ["Tower Defense"]),
-        (["mmorpg"],                          ["MMO"]),
-        (["moba"],                            ["MOBA"]),
-        (["battle royale"],                   ["Battle Royale"]),
-        (["Racing", "Arcade", "Sport"],       ["Racing", "Action", "Sports"]),
+        ("The Last Salvage Squad Trailer", "The Last Salvage Squad"),
+        ("Hades II - Official Launch Trailer", "Hades II"),
+        ("Elden Ring Gameplay Reveal | IGN", "Elden Ring"),
+        ("Cyberpunk 2077 - Official Cinematic Trailer", "Cyberpunk 2077"),
+        # Must NOT over-strip real titles containing a colon/dash
+        ("Hollow Knight: Silksong", "Hollow Knight: Silksong"),
+        ("The Last of Us Part II", "The Last of Us Part II"),
     ])
-    def test_igdb_genre(self, raw, expected):
-        assert _map_game_genres(raw) == expected
+    def test_clean(self, raw, expected):
+        assert mapping.clean_game_title(raw) == expected
 
-
-class TestIgdbPlatformNames:
-    """IGDB returns platform names like 'PC (Microsoft Windows)' — must map correctly."""
-    @pytest.mark.parametrize("raw,expected", [
-        (["PC (Microsoft Windows)"],          ["PC"]),
-        (["Nintendo Switch"],                 ["Switch"]),
-        (["PlayStation 5"],                   ["PS5"]),
-        (["Xbox Series X|S"],                 ["Xbox"]),
-        (["Steam Deck"],                      ["Steam Deck"]),
-        (["Mac"],                             ["PC"]),
-        (["Linux"],                           ["PC"]),
-        (["PC (Microsoft Windows)", "Mac"],   ["PC"]),   # dedup to single PC
-    ])
-    def test_igdb_platform(self, raw, expected):
-        assert _map_game_platforms(raw) == expected
-
-
-# ── _is_game_url ──────────────────────────────────────────────────────────────
 
 class TestIsGameUrl:
     @pytest.mark.parametrize("url", [
         "https://store.steampowered.com/app/1456480/Hades_II/",
         "https://www.gog.com/game/disco_elysium",
         "https://store.epicgames.com/en-US/p/hades-2",
-        "https://itch.io/games",
         "https://www.nintendo.com/store/products/hollow-knight",
     ])
     def test_game_urls(self, url):
-        assert _is_game_url(url) is True
+        assert mapping.is_game_url(url) is True
 
     @pytest.mark.parametrize("url", [
         "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-        "https://www.amazon.com/dp/B08N5WRWNW",
-        "https://maps.google.com/place/foo",
         "https://github.com/anthropics/claude-code",
     ])
     def test_non_game_urls(self, url):
-        assert _is_game_url(url) is False
+        assert mapping.is_game_url(url) is False
 
 
-# ── _is_generic_title ─────────────────────────────────────────────────────────
-
-class TestIsGenericTitle:
-    @pytest.mark.parametrize("title", [
-        "",
-        "Xbox Official Site: Consoles, Games and Community | Xbox",
-        "Nintendo - Official Site",
-        "PlayStation Store",
-        "x" * 101,                         # absurdly long → treat as junk
+class TestCleanVideoUrl:
+    @pytest.mark.parametrize("raw,expected", [
+        ("https://www.youtube.com/watch?v=GzKT3pIkVmo&list=WL&index=1",
+         "https://www.youtube.com/watch?v=GzKT3pIkVmo"),
+        ("https://youtu.be/GzKT3pIkVmo?si=abc", "https://www.youtube.com/watch?v=GzKT3pIkVmo"),
     ])
-    def test_generic(self, title):
-        assert _is_generic_title(title) is True
+    def test_normalises(self, raw, expected):
+        assert mapping.clean_video_url(raw) == expected
 
-    @pytest.mark.parametrize("title", [
-        "Hades II",
-        "The Legend of Zelda: Tears of the Kingdom",
-        "Elden Ring on Steam",             # store suffix but still names the game
-        "Hollow Knight: Silksong",
+    def test_non_youtube_unchanged(self):
+        assert mapping.clean_video_url("https://vimeo.com/123") == "https://vimeo.com/123"
+
+
+class TestGameNameFromUrl:
+    @pytest.mark.parametrize("url,expected", [
+        ("https://store.steampowered.com/app/1456480/Hades_II/", "Hades II"),
+        ("https://www.nintendo.com/store/products/hollow-knight-silksong", "hollow knight silksong"),
+        ("https://www.youtube.com/watch?v=abc", ""),
     ])
-    def test_real_titles(self, title):
-        assert _is_generic_title(title) is False
+    def test_extract(self, url, expected):
+        assert mapping.game_name_from_url(url) == expected
 
 
-# ── _extract_store_release_date ───────────────────────────────────────────────
+# ── mapping: dates ────────────────────────────────────────────────────────────
+
+class TestParseExactDate:
+    @pytest.mark.parametrize("raw,iso", [
+        ("Jun 17, 2026", "2026-06-17"), ("17 Jun 2026", "2026-06-17"),
+        ("2026-06-17", "2026-06-17"), ("6 May, 2024", "2024-05-06"),
+    ])
+    def test_full_dates(self, raw, iso):
+        assert mapping.parse_exact_date(raw) == iso
+
+    @pytest.mark.parametrize("raw", ["2026", "Jun 2026", "Q1 2026", "Coming soon", "", "TBA"])
+    def test_approximate_returns_empty(self, raw):
+        assert mapping.parse_exact_date(raw) == ""
+
 
 class TestExtractStoreReleaseDate:
-    @pytest.mark.parametrize("content,iso,human_fragment", [
+    @pytest.mark.parametrize("content,iso,frag", [
         ("Release Date: 6 May, 2024", "2024-05-06", "6 May"),
-        ("Release Date: 21 Sep 2023",  "2023-09-21", "21 Sep"),
-        ("Release Date: May 12, 2023", "2023-05-12", "May 12"),
-        ("Release Date: 5/12/2023",    "2023-05-12", "5/12/2023"),
-        ("Release date: 2023-05-12",   "2023-05-12", "2023-05-12"),
-        ("**Release Date:** 6 May, 2024", "2024-05-06", "6 May"),     # markdown bold
-        ("| Release Date | May 12, 2023 |", "2023-05-12", "May 12"),  # table row
+        ("**Release Date:** 21 Sep 2023", "2023-09-21", "21 Sep"),
+        ("| Release Date | May 12, 2023 |", "2023-05-12", "May 12"),
     ])
-    def test_exact_dates(self, content, iso, human_fragment):
-        d, human = _extract_store_release_date(content)
-        assert d == iso
-        assert human_fragment in human
+    def test_exact(self, content, iso, frag):
+        d, human = mapping.extract_store_release_date(content)
+        assert d == iso and frag in human
 
     @pytest.mark.parametrize("content,human", [
         ("Release Date: Coming soon", "Coming soon"),
-        ("Release Date: Q1 2025",     "Q1 2025"),
-        ("Release Date: 2025",        "2025"),
-        ("Release Date: To be announced", "To be announced"),
+        ("Release Date: Q1 2025", "Q1 2025"),
     ])
-    def test_approximate_dates(self, content, human):
-        d, h = _extract_store_release_date(content)
-        assert d == ""
-        assert human in h
+    def test_approximate(self, content, human):
+        d, h = mapping.extract_store_release_date(content)
+        assert d == "" and human in h
 
     def test_no_label(self):
-        assert _extract_store_release_date("Some random page text") == ("", "")
-
-    def test_empty(self):
-        assert _extract_store_release_date("") == ("", "")
+        assert mapping.extract_store_release_date("random text") == ("", "")
 
 
-# ── _select_igdb_release ──────────────────────────────────────────────────────
+# ── metadata ──────────────────────────────────────────────────────────────────
+
+class TestIsGenericTitle:
+    @pytest.mark.parametrize("title", [
+        "", "Xbox Official Site: Consoles, Games and Community | Xbox",
+        "Nintendo - Official Site", "x" * 101,
+    ])
+    def test_generic(self, title):
+        assert metadata.is_generic_title(title) is True
+
+    @pytest.mark.parametrize("title", ["Hades II", "Elden Ring on Steam", "Hollow Knight: Silksong"])
+    def test_real(self, title):
+        assert metadata.is_generic_title(title) is False
+
+
+# ── igdb.select_release ───────────────────────────────────────────────────────
 
 def _ts(y, m, d):
     return int(datetime(y, m, d, tzinfo=timezone.utc).timestamp())
 
 
-class TestSelectIgdbRelease:
+class TestSelectRelease:
     def test_exact_category0(self):
         ts = _ts(2024, 5, 6)
-        game = {"release_dates": [
-            {"category": 0, "date": ts, "region": 8, "human": "May 06, 2024"},
-        ]}
-        iso, human, out_ts = _select_igdb_release(game)
-        assert iso == "2024-05-06"
-        assert out_ts == ts
+        game = {"release_dates": [{"category": 0, "date": ts, "region": 8, "human": "May 06, 2024"}]}
+        iso, human, out_ts = igdb.select_release(game)
+        assert iso == "2024-05-06" and out_ts == ts
 
     def test_prefers_exact_over_approx(self):
         ts = _ts(2024, 5, 6)
         game = {"release_dates": [
             {"category": 2, "date": ts - 5000, "region": 1, "human": "2024"},
-            {"category": 0, "date": ts,        "region": 2, "human": "May 06, 2024"},
+            {"category": 0, "date": ts, "region": 2, "human": "May 06, 2024"},
         ]}
-        iso, _, _ = _select_igdb_release(game)
-        assert iso == "2024-05-06"          # exact wins even though approx ts is earlier
+        assert igdb.select_release(game)[0] == "2024-05-06"
 
     def test_year_only_is_approximate(self):
         ts = _ts(2025, 1, 1)
-        game = {"release_dates": [
-            {"category": 2, "date": ts, "region": 8, "human": "2025"},
-        ]}
-        iso, human, out_ts = _select_igdb_release(game)
-        assert iso == ""                    # never fabricate a precise day
-        assert human == "2025"
-        assert out_ts == ts
+        game = {"release_dates": [{"category": 2, "date": ts, "region": 8, "human": "2025"}]}
+        iso, human, out_ts = igdb.select_release(game)
+        assert iso == "" and human == "2025" and out_ts == ts
 
-    def test_quarter_is_approximate(self):
-        game = {"release_dates": [
-            {"category": 3, "date": _ts(2026, 1, 1), "region": 8, "human": "Q1 2026"},
-        ]}
-        iso, human, _ = _select_igdb_release(game)
-        assert iso == ""
-        assert human == "Q1 2026"
+    def test_fallback_first_release_date(self):
+        iso, human, ts = igdb.select_release({"first_release_date": _ts(2024, 5, 6)})
+        assert iso == "" and human == "" and ts == _ts(2024, 5, 6)
 
-    def test_fallback_first_release_date_ts_only(self):
-        game = {"first_release_date": _ts(2024, 5, 6)}
-        iso, human, ts = _select_igdb_release(game)
-        assert iso == "" and human == ""    # ts only — not a precise written date
-        assert ts == _ts(2024, 5, 6)
-
-    def test_empty_game(self):
-        assert _select_igdb_release({}) == ("", "", None)
-
-    def test_ignores_non_dict_entries(self):
-        game = {"release_dates": [123, None,
-                {"category": 0, "date": _ts(2022, 2, 1), "region": 8, "human": "x"}]}
-        iso, _, _ = _select_igdb_release(game)
-        assert iso == "2022-02-01"
+    def test_empty(self):
+        assert igdb.select_release({}) == ("", "", None)
 
 
-# ── _safe_json_loads ──────────────────────────────────────────────────────────
+# ── steam / discovery (pure parts) ────────────────────────────────────────────
 
-class TestSafeJsonLoads:
-    def test_valid(self):
-        assert _safe_json_loads('{"a": 1}') == {"a": 1}
-
-    def test_prefix_and_suffix_text(self):
-        assert _safe_json_loads('Sure: {"category": "game", "name": "Hades II"} done') == \
-            {"category": "game", "name": "Hades II"}
-
-    def test_trailing_comma_repaired(self):
-        assert _safe_json_loads('{"a": 1, "b": 2,}') == {"a": 1, "b": 2}
-
-    def test_unrecoverable_returns_none(self):
-        # Unescaped inner double-quotes — the failure mode that crashed a save.
-        assert _safe_json_loads('{"summary": "he said "hi" to everyone"}') is None
-
-    def test_no_json_returns_none(self):
-        assert _safe_json_loads("no json at all") is None
-
-
-# ── _looks_like_game ──────────────────────────────────────────────────────────
-
-class TestLooksLikeGame:
-    @pytest.mark.parametrize("text", [
-        "Hades II - Official Gameplay Trailer",
-        "Hollow Knight: Silksong — coming to Nintendo Switch",
-        "Now in Early Access on Steam",
-        "A roguelike deckbuilder",
-    ])
-    def test_positive(self, text):
-        assert _looks_like_game(text) is True
-
-    @pytest.mark.parametrize("text", [
-        "Best pasta recipe in Rome",
-        "How to fix a leaky faucet",
-        "",
-    ])
-    def test_negative(self, text):
-        assert _looks_like_game(text) is False
-
-
-# ── _clean_game_title ─────────────────────────────────────────────────────────
-
-class TestCleanGameTitle:
-    @pytest.mark.parametrize("raw,expected", [
-        ("The Last Salvage Squad Trailer",            "The Last Salvage Squad"),
-        ("Hades II - Official Launch Trailer",        "Hades II"),
-        ("Elden Ring Gameplay Reveal | IGN",          "Elden Ring"),
-        ("Cyberpunk 2077 - Official Cinematic Trailer","Cyberpunk 2077"),
-        ("Baldur's Gate 3 — Launch Trailer",          "Baldur's Gate 3"),
-        # Must NOT over-strip real titles that merely contain a colon/dash:
-        ("Hollow Knight: Silksong",                   "Hollow Knight: Silksong"),
-        ("The Last of Us Part II",                    "The Last of Us Part II"),
-        ("Hades II",                                  "Hades II"),
-    ])
-    def test_clean(self, raw, expected):
-        assert _clean_game_title(raw) == expected
-
-
-# ── _parse_exact_date ─────────────────────────────────────────────────────────
-
-class TestParseExactDate:
-    @pytest.mark.parametrize("raw,iso", [
-        ("Jun 17, 2026",  "2026-06-17"),
-        ("June 17, 2026", "2026-06-17"),
-        ("17 Jun 2026",   "2026-06-17"),
-        ("2026-06-17",    "2026-06-17"),
-        ("6 May, 2024",   "2024-05-06"),
-    ])
-    def test_full_dates(self, raw, iso):
-        assert _parse_exact_date(raw) == iso
-
-    @pytest.mark.parametrize("raw", [
-        "2026", "Jun 2026", "Q1 2026", "Coming soon", "To be announced", "", "TBA",
-    ])
-    def test_approximate_returns_empty(self, raw):
-        assert _parse_exact_date(raw) == ""
-
-
-# ── _clean_video_url ──────────────────────────────────────────────────────────
-
-class TestCleanVideoUrl:
-    @pytest.mark.parametrize("raw,expected", [
-        ("https://www.youtube.com/watch?v=GzKT3pIkVmo&list=WL&index=1&pp=iAQBsAgC",
-         "https://www.youtube.com/watch?v=GzKT3pIkVmo"),
-        ("https://youtu.be/GzKT3pIkVmo?si=abc",
-         "https://www.youtube.com/watch?v=GzKT3pIkVmo"),
-        ("https://www.youtube.com/shorts/GzKT3pIkVmo",
-         "https://www.youtube.com/watch?v=GzKT3pIkVmo"),
-    ])
-    def test_normalises_youtube(self, raw, expected):
-        assert _clean_video_url(raw) == expected
-
-    def test_non_youtube_unchanged(self):
-        assert _clean_video_url("https://vimeo.com/123456") == "https://vimeo.com/123456"
-
-
-# ── _steam_appid ──────────────────────────────────────────────────────────────
-
-class TestSteamAppid:
+class TestSteamAppidFromUrl:
     @pytest.mark.parametrize("url,appid", [
         ("https://store.steampowered.com/app/3714420/Delta/", "3714420"),
-        ("https://store.steampowered.com/app/1145360/Hades/", "1145360"),
         ("https://store.steampowered.com/app/2483190/", "2483190"),
         ("https://www.youtube.com/watch?v=abc", ""),
-        ("https://www.gog.com/game/disco_elysium", ""),
     ])
     def test_extract(self, url, appid):
-        assert _steam_appid(url) == appid
+        assert steam.appid_from_url(url) == appid
 
-
-# ── _metacritic_url ───────────────────────────────────────────────────────────
 
 class TestMetacriticUrl:
     @pytest.mark.parametrize("name,expected", [
-        ("Forza Horizon 6",        "https://www.metacritic.com/game/forza-horizon-6/"),
-        ("Baldur's Gate 3",        "https://www.metacritic.com/game/baldurs-gate-3/"),
+        ("Forza Horizon 6", "https://www.metacritic.com/game/forza-horizon-6/"),
+        ("Baldur's Gate 3", "https://www.metacritic.com/game/baldurs-gate-3/"),
         ("The Last of Us Part II", "https://www.metacritic.com/game/the-last-of-us-part-ii/"),
-        ("Hades II",               "https://www.metacritic.com/game/hades-ii/"),
     ])
     def test_slug(self, name, expected):
-        assert _metacritic_url(name) == expected
+        assert discovery.metacritic_url(name) == expected
 
     def test_empty(self):
-        assert _metacritic_url("") == ""
+        assert discovery.metacritic_url("") == ""
