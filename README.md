@@ -114,8 +114,3 @@ webhook at `https://<deployment>/api/telegram`.
   Llama models.
 - **Serverless routing shim.** A middleware restores the original request path from a query
   param, working around a Vercel rewrite that otherwise collapses every route to one path.
-
----
-
-<sub>Repo/Vercel project are still named `link-organizer` — rename those in GitHub + Vercel
-to match if you like; nothing in the code depends on the name.</sub>
